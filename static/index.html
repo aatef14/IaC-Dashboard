@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>IaC-Dashboard</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-left">
+      <button id="btn-back" class="btn hidden">&larr; Projects</button>
+      <h1>IaC-Dashboard</h1>
+    </div>
+    <div class="header-right">
+      <button id="btn-theme" class="btn" data-tip="Toggle dark mode" aria-label="Toggle dark mode">
+        <span class="theme-icon"></span>
+      </button>
+    </div>
+  </header>
+
+  <!-- ===================== LANDING VIEW (Organizations) ===================== -->
+  <main id="landing-view">
+    <div class="landing-actions">
+      <button id="btn-how-to-use" class="btn big">How to Use</button>
+      <button id="btn-add-org" class="btn big primary">+ New Organization</button>
+    </div>
+
+    <h2>Organizations</h2>
+    <div id="orgs-grid" class="projects-grid"></div>
+    <p id="no-orgs-msg" class="muted hidden">No organizations yet — click "New Organization" to create one. Projects live inside an organization, so this comes first.</p>
+  </main>
+
+  <!-- ===================== ORG VIEW (Work Projects inside one org) ===================== -->
+  <main id="org-view" class="hidden">
+    <div id="org-title-bar">
+      <h2 id="org-view-name"></h2>
+      <button id="btn-add-project" class="btn primary">+ Add Work Project</button>
+    </div>
+
+    <div id="projects-grid" class="projects-grid"></div>
+    <p id="no-projects-msg" class="muted hidden">No work projects yet in this organization — click "Add Work Project" to set one up.</p>
+  </main>
+
+  <!-- ===================== WORKSPACE VIEW ===================== -->
+  <main id="workspace-view" class="hidden">
+    <div id="workspace-title-bar">
+      <h2 id="workspace-project-name"></h2>
+      <div class="pills" id="workspace-pills"></div>
+    </div>
+
+    <div id="workspace-body">
+    <aside id="runs-panel">
+      <button id="btn-init" class="btn full-width">Re-run Init</button>
+      <div class="btn-row">
+        <button id="btn-fmt" class="btn" data-tip="Format&#10;Runs terraform fmt -recursive, rewriting .tf/.tfvars files in place.&#10;Whitespace and alignment only -- never changes what the config means.">Format</button>
+        <button id="btn-validate" class="btn" disabled>Validate</button>
+      </div>
+      <label class="field-label">Plan name</label>
+      <input id="plan-name-input" placeholder="e.g. before refactor" />
+      <div class="btn-row">
+        <button id="btn-plan" class="btn primary" disabled>Run Plan</button>
+        <button id="btn-plan-destroy" class="btn danger-outline" disabled data-tip="Plan Destroy&#10;Plans tearing down everything this deployment manages.&#10;Planning is safe -- nothing is destroyed until you separately Request Apply and confirm.">Plan Destroy</button>
+      </div>
+      <h2>Runs</h2>
+      <ul id="runs-list"></ul>
+    </aside>
+
+    <section id="detail-panel">
+      <div id="run-header">
+        <span id="run-title">No run selected</span>
+        <div class="run-header-right">
+          <button id="btn-cancel-run" class="btn danger-outline hidden">Cancel</button>
+          <span id="run-status" class="status"></span>
+        </div>
+      </div>
+
+      <div id="plan-view-toolbar" class="hidden">
+        <span id="plan-diff-counts"></span>
+        <div class="toolbar-actions">
+          <a id="btn-download-json" class="btn" download>Download JSON</a>
+          <a id="btn-download-csv" class="btn" download>Download CSV</a>
+          <button id="btn-compare-plan" class="btn">Compare with...</button>
+          <button id="btn-toggle-raw-log" class="btn">Show raw log</button>
+        </div>
+      </div>
+
+      <div id="plan-diff-container" class="hidden">
+        <table id="plan-diff-table">
+          <thead><tr><th>Action</th><th>Resource</th><th>Changed fields</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <pre id="log"></pre>
+
+      <div id="action-bar">
+        <div id="plan-summary" class="hidden">
+          <div id="summary-text"></div>
+          <button id="btn-request-apply" class="btn danger-outline">Request Apply</button>
+        </div>
+
+        <div id="confirm-box" class="hidden">
+          <p id="confirm-warning-text" class="warn-text"></p>
+          <div class="confirm-row">
+            <code id="confirm-token"></code>
+            <span id="confirm-expiry" class="muted"></span>
+          </div>
+          <div class="confirm-row">
+            <input id="confirm-input" placeholder="Paste/retype the code to confirm" />
+            <button id="btn-confirm-apply" class="btn danger">Confirm &amp; Apply</button>
+          </div>
+        </div>
+      </div>
+    </section>
+    </div>
+  </main>
+
+  <!-- ===================== MODALS ===================== -->
+  <div id="modal-overlay" class="hidden">
+
+    <div id="how-to-use-modal" class="modal modal-wide hidden">
+      <h2>How to Use</h2>
+
+      <h3>1. Organizations &amp; Work Projects</h3>
+      <p>Work Projects live inside an <b>Organization</b> --
+        <code>/&lt;org-name&gt;/&lt;project-name&gt;</code>. Create an organization
+        first (landing page, <b>+ New Organization</b>), open it, then
+        <b>+ Add Work Project</b> inside it.</p>
+
+      <h3>2. Expected folder structure</h3>
+      <p>A "project folder" is any folder shaped like this — this dashboard scans
+        for exactly this layout:</p>
+      <pre class="folder-tree">your-project-folder/
+├── modules/                          &lt;- required, any content
+├── tf-deployment-a/                  &lt;- a "tf-deployment*" folder
+│   ├── main.tf
+│   ├── environmentVariables/
+│   │   ├── terraform.dev.tfvars      &lt;- defines env "dev"
+│   │   └── terraform.prod.tfvars     &lt;- defines env "prod"
+│   └── backend/
+│       ├── azurerm.dev.tfbackend     &lt;- must match "dev"
+│       └── azurerm.prod.tfbackend    &lt;- must match "prod"
+└── tf-deployment-b/                  &lt;- another deployment, same shape</pre>
+      <p class="muted">An environment only shows up in the picker if the SAME name
+        appears in both a <code>terraform.&lt;env&gt;.tfvars</code> file and an
+        <code>azurerm.&lt;env&gt;.tfbackend</code> file — <code>init</code> needs the
+        backend file, <code>plan</code>/<code>apply</code> need the tfvars file, so
+        an environment missing either one can't actually be used. When adding a
+        project you can either point at a folder already shaped like this
+        ("Select existing folder"), or pick an empty folder and let the dashboard
+        generate a minimal starter version of it for you ("Initialize new folder").</p>
+
+      <h3>3. Using the dashboard</h3>
+      <ol>
+        <li>On the landing page, create or open an <b>Organization</b>.</li>
+        <li>Inside it, click <b>Add Work Project</b>. Give it a name, then either <b>Select existing folder</b>
+          (Browse + Scan Folder) or <b>Initialize new folder</b> (Browse to an
+          empty folder + Initialize Folder).</li>
+        <li>Pick which deployment and environment to use, then
+          <b>Create Project</b> — this saves it and runs <code>terraform init</code>
+          automatically. Init/Plan first check you're actually authenticated to the
+          right cloud account (for Azure: logged in, and if the tfvars references a
+          <code>subscription_id</code>, that it's one you can access) and fail with
+          a clear message instead of a confusing terraform error if not.</li>
+        <li>Open the project card. Click <b>Run Plan</b> (name it something) and
+          watch the live output.</li>
+        <li>Click <b>Request Apply</b> — this only shows you a summary and a
+          one-time confirmation code. Nothing is applied yet.</li>
+        <li>Type/paste that code and click <b>Confirm &amp; Apply</b> to actually
+          run <code>terraform apply</code>.</li>
+        <li>Hover a project card and click <b>&#8942;</b> to edit its folder/deployment/
+          environment, clear its run history, or delete it (delete never touches
+          real cloud resources — it only forgets the local bookkeeping entry). The
+          same menu on an organization card deletes it and every project inside it.</li>
+      </ol>
+
+      <h3>4. Using it from Claude Code (MCP)</h3>
+      <p>This dashboard doubles as an MCP server at
+        <code>http://127.0.0.1:8765/mcp</code>. With the dashboard running, add it
+        once to a project's <code>.mcp.json</code>:</p>
+      <pre class="folder-tree">{
+  "mcpServers": {
+    "IaC-Dashboard": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}</pre>
+      <p>Restart Claude Code (or run <code>/mcp</code>) after the dashboard is
+        running so it connects. Tools it gets:</p>
+      <ul class="tool-list">
+        <li><code>list_organizations</code> / <code>add_organization</code> / <code>delete_organization</code> — list, create, or remove (cascade) an organization</li>
+        <li><code>list_projects</code> / <code>discover_project</code> / <code>initialize_project_folder</code> / <code>add_project</code> — list saved projects, scan an existing folder or scaffold a new one, save a new project</li>
+        <li><code>update_project</code> / <code>delete_project</code> / <code>clear_project_runs</code> — edit, remove, or reset a saved project</li>
+        <li><code>init_project</code> — run <code>terraform init</code> for a project (after checking cloud auth)</li>
+        <li><code>fmt</code> / <code>validate</code> — local, no-cloud-calls checks; <code>fmt</code> reformats <code>.tf</code>/<code>.tfvars</code> files in place (recursively, so <code>environmentVariables/</code> is covered)</li>
+        <li><code>terraform_plan</code> / <code>plan_destroy</code> — run a named plan, or plan a full teardown</li>
+        <li><code>request_apply</code> / <code>confirm_apply</code> — the same two-step confirmation as the UI; Claude always shows you the plan summary and waits for your yes before calling <code>confirm_apply</code></li>
+        <li><code>get_run_status</code> / <code>list_runs</code> — check progress</li>
+      </ul>
+      <p class="muted">Just ask in chat, e.g. <i>"plan the QISP RAG sandbox project"</i>
+        or <i>"add my other repo as a project and plan the prod environment"</i> —
+        Claude will call these tools itself, and any run it starts shows up in this
+        same dashboard too.</p>
+
+      <button class="btn primary modal-close">Got it</button>
+    </div>
+
+    <div id="add-project-modal" class="modal hidden">
+      <h2 id="add-project-modal-title">Add Work Project</h2>
+
+      <label class="field-label">Name</label>
+      <input id="project-name-input" placeholder="e.g. QISP RAG sandbox" />
+
+      <div id="folder-mode-tabs" class="tabs">
+        <button type="button" id="tab-existing-folder" class="tab active" data-mode="existing">Select existing folder</button>
+        <button type="button" id="tab-new-folder" class="tab" data-mode="new">Initialize new folder</button>
+      </div>
+
+      <label class="field-label" id="project-root-label">Project folder</label>
+      <div class="confirm-row">
+        <input id="project-root-input" placeholder="C:\path\to\IAC" />
+        <button id="btn-browse" class="btn">Browse&hellip;</button>
+      </div>
+      <p id="new-folder-hint" class="muted hidden">Pick an EMPTY folder — this will create <code>modules/</code> and a starter
+        <code>tf-deployment/</code> (main.tf, backend/, environmentVariables/) inside it, using the cloud provider selected above.</p>
+      <button id="btn-scan" class="btn full-width">Scan Folder</button>
+      <button id="btn-initialize-folder" class="btn full-width hidden">Initialize Folder</button>
+
+      <div id="deployment-select-box" class="hidden">
+        <label class="field-label">Deployment</label>
+        <select id="deployment-select"></select>
+        <label class="field-label">Environment</label>
+        <select id="environment-select"></select>
+      </div>
+
+      <div id="add-project-error" class="warn-text hidden"></div>
+
+      <div class="modal-actions">
+        <button class="btn modal-close">Cancel</button>
+        <button id="btn-create-project" class="btn primary" disabled>Create Project</button>
+      </div>
+    </div>
+
+    <div id="add-org-modal" class="modal hidden">
+      <h2>New Organization</h2>
+      <label class="field-label">Name</label>
+      <input id="org-name-input" placeholder="e.g. Acme Corp" />
+      <div id="add-org-error" class="warn-text hidden"></div>
+      <div class="modal-actions">
+        <button class="btn modal-close">Cancel</button>
+        <button id="btn-create-org" class="btn primary">Create Organization</button>
+      </div>
+    </div>
+
+    <div id="confirm-dialog-modal" class="modal hidden">
+      <h2 id="confirm-dialog-title"></h2>
+      <p id="confirm-dialog-message"></p>
+      <div class="modal-actions">
+        <button id="confirm-dialog-cancel" class="btn">Cancel</button>
+        <button id="confirm-dialog-ok" class="btn danger">Confirm</button>
+      </div>
+    </div>
+
+    <div id="compare-picker-modal" class="modal hidden">
+      <h2>Compare with...</h2>
+      <p class="muted">Pick another plan for this project to compare against.</p>
+      <ul id="compare-picker-list" class="compare-picker-list"></ul>
+      <div class="modal-actions">
+        <button class="btn modal-close">Cancel</button>
+      </div>
+    </div>
+
+    <div id="compare-results-modal" class="modal modal-wide hidden">
+      <h2 id="compare-results-title">Comparing plans</h2>
+      <p id="compare-results-summary" class="muted"></p>
+      <table id="compare-results-table" class="hidden">
+        <thead><tr><th>Status</th><th>Resource</th><th>Detail</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="modal-actions">
+        <button class="btn modal-close">Close</button>
+      </div>
+    </div>
+
+  </div>
+
+  <div id="toast-container"></div>
+  <div id="tooltip" class="hidden" role="tooltip"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+# ---------------------------------------------------------------------------
+# Runtime state -- machine-local, and it contains real infrastructure detail
+# (Azure subscription/tenant ids, resource names, plan output, absolute paths
+# from this machine). None of it belongs in a shared repo, least of all a
+# public one. The app recreates every one of these on first run.
+# ---------------------------------------------------------------------------
+
+# Saved organizations / work projects -- absolute local paths + ids
+organizations.json
+projects.json
+
+# Run history: SQLite rows include the full terraform log of every run
+runs.db
+runs.db-journal
+runs.db-wal
+runs.db-shm
+
+# Per-run artefacts: plan.tfplan (binary plan) and diff.json (resource-by-
+# resource attribute values, i.e. a map of the real deployed infrastructure)
+project-data/
+
+# Server logs and the background-process pid file
+server.log
+server.log.err
+.server.pid
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---------------------------------------------------------------------------
+# Editors / OS
+# ---------------------------------------------------------------------------
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
+
+# Scratch folders used while testing the scaffolder
+.authtest*/
+.fmt-verify/
+.scratch-*/

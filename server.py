@@ -1,0 +1,764 @@
+"""
+IaC-Dashboard -- one process, two front doors onto the same state:
+
+  1. A local web dashboard (this file's custom_route handlers + static/):
+     a landing page listing saved Work Projects, an "Add Work Project" flow
+     (name it, pick/browse a folder, pick deployment+environment), and a
+     per-project workspace with Run Plan / Request Apply / Confirm & Apply
+     and live output.
+  2. An MCP server (the @server.tool() functions below) so Claude Code can
+     drive the exact same add-project/init/plan/apply/status flow and relay
+     results back to you in chat.
+
+Both talk to run_manager.py, so a project added or a run started from either
+side shows up in both places. Binds to 127.0.0.1 only -- this can trigger
+real changes against real Azure subscriptions, it should never be reachable
+off this machine.
+
+Apply is never one-click from either side: request_apply() only returns a
+confirmation token + plan summary, and confirm_apply() requires that exact
+token. From the dashboard that means typing/pasting the shown code into the
+confirm box. From MCP, Claude must show you the summary and only call
+confirm_apply after you say yes in chat.
+"""
+
+import asyncio
+import csv
+import io
+import json
+import os
+
+import uvicorn
+from starlette.requests import Request
+from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+
+import run_manager as rm
+from mcp.server.mcpserver import MCPServer
+
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+HOST = "127.0.0.1"
+PORT = 8765
+
+
+async def _json_body(request: Request) -> tuple[dict | None, JSONResponse | None]:
+    """Parse the request body as JSON, returning (body, None) on success or
+    (None, error_response) on malformed/missing JSON -- callers just
+    `if err: return err`."""
+    try:
+        body = await request.json()
+    except ValueError:
+        return None, JSONResponse({"error": "request body is not valid JSON"}, status_code=400)
+    if not isinstance(body, dict):
+        return None, JSONResponse({"error": "request body must be a JSON object"}, status_code=400)
+    return body, None
+
+
+server = MCPServer(
+    name="IaC-Dashboard",
+    instructions=(
+        "Controls terraform init/plan/apply for named, saved Terraform IaC "
+        "'projects' on this machine, grouped under Organizations "
+        "(/<org-name>/<project-name>). Nothing is hardcoded to one "
+        "deployment. Workflow: (1) call list_organizations -- if none exist "
+        "yet, create one with add_organization(name) before anything else. "
+        "(2) call list_projects(org_id) -- if the user already has one they "
+        "mean, use its id. (3) To add a new one: EITHER discover_project"
+        "(project_root) to scan an existing folder (must contain modules/ + "
+        "tf-deployment* dirs), OR initialize_project_folder(project_root) "
+        "to scaffold a brand-new empty folder into that same "
+        "shape -- ask the user which they want. Either way, see what "
+        "deployments/environments it offers, ask the user which one, what to "
+        "name it if not already told, then add_project(org_id, name, "
+        "project_root, deployment, environment). (4) init_project(project_id) -- required at least "
+        "once before plan will work; fails clearly if the CLI login doesn't "
+        "match what this project needs (e.g. not logged into Azure, or wrong "
+        "subscription) instead of a confusing terraform error. (5) "
+        "terraform_plan(project_id). (6) request_apply(plan_run_id) -- show "
+        "the user the returned summary and get their explicit yes in chat "
+        "BEFORE (7) confirm_apply(token). Never call confirm_apply on your "
+        "own initiative."
+    ),
+)
+
+
+# ===================================================================================
+# MCP TOOLS
+# ===================================================================================
+
+
+@server.tool()
+async def list_organizations() -> list:
+    """List saved Organizations (name, id, how many projects each has).
+    Projects must belong to an organization -- if this is empty, create one
+    with add_organization before adding any project."""
+    return rm.list_orgs()
+
+
+@server.tool()
+async def add_organization(name: str) -> dict:
+    """Create a new Organization. Projects are addressed as
+    /<org-name>/<project-name>, so every project must belong to one --
+    call this first if list_organizations came back empty."""
+    try:
+        return await asyncio.to_thread(rm.add_org, name)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def delete_organization(org_id: str) -> dict:
+    """Delete an Organization and cascade-delete every project inside it
+    (same as deleting each project individually -- forgets local
+    bookkeeping only, never touches real cloud resources). Confirm with the
+    user before calling this."""
+    await asyncio.to_thread(rm.remove_org, org_id)
+    return {"ok": True}
+
+
+@server.tool()
+async def list_projects(org_id: str | None = None) -> list:
+    """List saved Work Projects (name, folder, deployment, environment, and
+    whether it's been terraform-init'd -- detected from .terraform/ on disk,
+    so it stays accurate across restarts), optionally filtered to one
+    org_id."""
+    return rm.list_projects(org_id)
+
+
+@server.tool()
+async def discover_project(project_root: str) -> dict:
+    """Scan an EXISTING folder (read-only, no side effects): it must contain
+    a modules/ directory and at least one tf-deployment* directory. Returns
+    each deployment found and the environments it supports (only
+    environments with BOTH a matching
+    environmentVariables/terraform.<env>.tfvars AND a
+    backend/*.<env>.tfbackend file count). Call this before add_project when
+    the user is pointing at a folder that already has Terraform code in it.
+    For a brand-new empty folder, use initialize_project_folder instead."""
+    try:
+        return await asyncio.to_thread(rm.discover_project, project_root)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def initialize_project_folder(project_root: str) -> dict:
+    """Scaffold a brand-new Terraform project into an EMPTY folder: an empty
+    modules/ dir, plus tf-deployment/main.tf (azurerm provider),
+    tf-deployment/backend/, and tf-deployment/environmentVariables/ with one
+    placeholder "dev" tfvars+tfbackend pair. Refuses a non-empty folder --
+    use discover_project for anything that already has content. Returns the
+    same shape as discover_project (deployments/environments found), ready to
+    pass into add_project -- but the generated files contain REPLACE_ME
+    placeholders the user still needs to fill in with real values before init
+    will actually succeed."""
+    try:
+        return await asyncio.to_thread(rm.initialize_project_folder, project_root)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def add_project(org_id: str, name: str, project_root: str, deployment: str, environment: str) -> dict:
+    """Save a new named Work Project, under an existing Organization
+    (org_id), pointing at one deployment+environment discovered via
+    discover_project or initialize_project_folder. Azure is the only
+    supported cloud provider right now. Does not run init yet -- call
+    init_project with the returned id next."""
+    try:
+        return await asyncio.to_thread(rm.add_project, org_id, name, project_root, deployment, environment)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def update_project(project_root: str, deployment: str, environment: str, project_id: str) -> dict:
+    """Change a saved project's folder/deployment/environment in place (same
+    id, same name, same run history). Name is not editable -- it's the
+    stable key the dashboard's /project/<name> URLs are built on; delete and
+    re-add the project if you genuinely need to rename it. If the folder/
+    deployment/environment actually changed, the project is marked
+    not-initialized again -- call init_project before terraform_plan after
+    an update like that."""
+    try:
+        return await asyncio.to_thread(rm.update_project, project_id, project_root, deployment, environment)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def delete_project(project_id: str) -> dict:
+    """Remove a saved project from the dashboard. Does NOT run terraform
+    destroy or touch any cloud resources -- only forgets this local
+    bookkeeping entry. Confirm with the user before calling this."""
+    await asyncio.to_thread(rm.remove_project, project_id)
+    return {"ok": True}
+
+
+@server.tool()
+async def clear_project_runs(project_id: str) -> dict:
+    """Delete the init/plan/apply run history for one project (and its
+    saved .tfplan files). Refuses if a run is currently in progress for it.
+    Confirm with the user before calling this."""
+    try:
+        await asyncio.to_thread(rm.clear_runs, project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+    return {"ok": True}
+
+
+@server.tool()
+async def check_auth(project_id: str) -> dict:
+    """Check whether the current Azure CLI login can actually be used for this
+    project, WITHOUT starting a run: verifies `az account show` succeeds and,
+    if the tfvars names a subscription_id, that the logged-in identity can see
+    it. Returns {authenticated, reason}. This is the same check that gates
+    init/plan, so use it to tell the user to `az login` before they wait on a
+    run that was going to be refused anyway."""
+    try:
+        return await asyncio.to_thread(rm.check_auth, project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def init_project(project_id: str) -> dict:
+    """Run `terraform init` for a saved project and block until it finishes
+    (up to 2 minutes). Must succeed at least once per server run before
+    terraform_plan will work for that project."""
+    try:
+        run = rm.init_project(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+    await asyncio.to_thread(rm.wait_for, run.id, 120)
+    r = rm.get_run(run.id)
+    return {**r.to_dict(), "tail": r.lines[-30:]}
+
+
+@server.tool()
+async def fmt(project_id: str) -> dict:
+    """Run `terraform fmt -recursive` for this project: rewrites any
+    badly-formatted .tf/.tfvars files in place and returns the list of files
+    it reformatted (empty means everything was already formatted). Purely
+    local -- no Azure calls, no init required -- and only ever changes
+    whitespace/alignment, never what the config means, so it's safe to run
+    unprompted. Covers the deployment directory and its subdirectories (so
+    environmentVariables/*.tfvars is included); backend/*.tfbackend is
+    skipped because terraform doesn't recognize that extension."""
+    try:
+        run = rm.run_fmt(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+    await asyncio.to_thread(rm.wait_for, run.id, 60)
+    r = rm.get_run(run.id)
+    return {**r.to_dict(), "reformatted_files": [ln for ln in r.lines if ln.strip()], "tail": r.lines[-40:]}
+
+
+@server.tool()
+async def validate(project_id: str) -> dict:
+    """Run `terraform validate` for this project -- checks config/schema
+    only, no Azure calls, but requires init_project to have succeeded first."""
+    try:
+        run = rm.run_validate(project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+    await asyncio.to_thread(rm.wait_for, run.id, 60)
+    r = rm.get_run(run.id)
+    return {**r.to_dict(), "tail": r.lines[-40:]}
+
+
+@server.tool()
+async def terraform_plan(project_id: str, name: str) -> dict:
+    """Run `terraform plan` for this project and block until it finishes (up
+    to 5 minutes). `name` is a required short label for this plan run (e.g.
+    'before refactor', 'adding cosmos') -- ask the user what to call it if
+    they haven't said. Returns the run_id, status, a parsed add/change/destroy
+    summary, and the last 30 log lines. Requires init_project to have
+    succeeded for this project first. Always call this before request_apply."""
+    try:
+        run = rm.start_plan(project_id, name)
+    except ValueError as e:
+        return {"error": str(e)}
+    await asyncio.to_thread(rm.wait_for, run.id, 300)
+    r = rm.get_run(run.id)
+    return {**r.to_dict(), "tail": r.lines[-30:]}
+
+
+@server.tool()
+async def plan_destroy(project_id: str, name: str) -> dict:
+    """Run `terraform plan -destroy` for this project -- plans tearing down
+    EVERYTHING this deployment manages. Same rules as terraform_plan (name
+    required, requires init_project first). This only plans; it does not
+    destroy anything by itself. As with any plan, follow up with
+    request_apply then confirm_apply (after explicit user approval) to
+    actually run the destroy."""
+    try:
+        run = rm.start_plan(project_id, name, destroy=True)
+    except ValueError as e:
+        return {"error": str(e)}
+    await asyncio.to_thread(rm.wait_for, run.id, 300)
+    r = rm.get_run(run.id)
+    return {**r.to_dict(), "tail": r.lines[-30:]}
+
+
+@server.tool()
+async def request_apply(plan_run_id: str) -> dict:
+    """Request permission to apply a previously-run successful plan.
+    Returns a one-time confirmation token plus the plan's add/change/destroy
+    summary. This does NOT apply anything. Show the summary to the user and
+    only proceed to confirm_apply after they explicitly approve it in chat.
+    Fails if the tfvars/backend file changed on disk since the plan was
+    generated -- re-run terraform_plan in that case."""
+    try:
+        return await asyncio.to_thread(rm.request_apply_confirmation, plan_run_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def confirm_apply(token: str) -> dict:
+    """Execute `terraform apply` using the plan tied to this confirmation
+    token, and block until it finishes (up to 10 minutes). Only call this
+    after the user has explicitly approved the plan summary shown by
+    request_apply in this conversation -- never call it unprompted."""
+    try:
+        run = await asyncio.to_thread(rm.confirm_apply, token)
+    except ValueError as e:
+        return {"error": str(e)}
+    await asyncio.to_thread(rm.wait_for, run.id, 600)
+    r = rm.get_run(run.id)
+    return {**r.to_dict(), "tail": r.lines[-40:]}
+
+
+@server.tool()
+async def cancel_run(run_id: str) -> dict:
+    """Kill the terraform process for a run that's still queued/running,
+    releasing the one-run-at-a-time lock on its project. Safe for
+    init/fmt/validate/plan -- none of them change infrastructure. For an
+    APPLY, warn the user first and get their explicit yes: terraform may have
+    already created some resources, so state can be left partially applied,
+    and the hard kill can leave the state file locked (needing `terraform
+    force-unlock`)."""
+    try:
+        return await asyncio.to_thread(rm.cancel_run, run_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def get_run_status(run_id: str) -> dict:
+    """Poll the current status and log tail of an init/plan/apply run by id."""
+    r = rm.get_run(run_id)
+    if r is None:
+        return {"error": "run not found"}
+    return {**r.to_dict(), "tail": r.lines[-40:]}
+
+
+@server.tool()
+async def get_plan_diff(run_id: str) -> dict:
+    """Get a structured resource-by-resource create/update/delete/replace
+    table for a completed plan run, parsed from its saved .tfplan file --
+    much more useful to summarize for the user than the raw log. Each entry
+    includes before/after attribute values (sensitive ones redacted to
+    "(sensitive value)") and, for updates/replaces, which top-level
+    attributes actually changed. Use this after terraform_plan/plan_destroy
+    instead of dumping the raw log tail when you want to describe what a
+    plan will do."""
+    try:
+        return await asyncio.to_thread(rm.get_plan_diff, run_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def compare_plans(run_id_a: str, run_id_b: str) -> dict:
+    """Compare two plan runs for the SAME project, resource by resource --
+    use this to answer "why does this plan look different from last time"
+    instead of eyeballing two separate get_plan_diff results. Only returns
+    resources that actually differ between the two plans (added/removed/
+    changed action/changed fields) -- always labeled older/newer by
+    timestamp regardless of argument order."""
+    try:
+        return await asyncio.to_thread(rm.compare_plans, run_id_a, run_id_b)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def list_runs(project_id: str | None = None, include_checks: bool = False) -> list:
+    """List recent runs (most recent first), optionally filtered to one
+    project_id. Only shows init/plan/apply by default -- pass
+    include_checks=True to also see fmt/validate (those are never
+    persisted, so only ones from this server session are ever visible)."""
+    return rm.list_runs_summary(project_id, include_checks=include_checks)
+
+
+# ===================================================================================
+# DASHBOARD -- static files
+# ===================================================================================
+
+
+_NO_STORE_HEADERS = {"Cache-Control": "no-store, must-revalidate"}
+
+
+@server.custom_route("/", methods=["GET"])
+async def index(request: Request):
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
+
+
+@server.custom_route("/app.js", methods=["GET"])
+async def app_js(request: Request):
+    return FileResponse(
+        os.path.join(STATIC_DIR, "app.js"), media_type="application/javascript", headers=_NO_STORE_HEADERS
+    )
+
+
+@server.custom_route("/style.css", methods=["GET"])
+async def style_css(request: Request):
+    return FileResponse(os.path.join(STATIC_DIR, "style.css"), media_type="text/css", headers=_NO_STORE_HEADERS)
+
+
+# ===================================================================================
+# DASHBOARD -- REST API
+# ===================================================================================
+
+
+@server.custom_route("/api/browse-folder", methods=["POST"])
+async def api_browse_folder(request: Request):
+    """Pops a native Windows folder picker on this machine and returns the
+    chosen path. Blocks (in a worker thread) until the user picks or cancels."""
+    try:
+        path = await asyncio.to_thread(rm.open_folder_dialog)
+    except RuntimeError as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+    return JSONResponse({"path": path})
+
+
+@server.custom_route("/api/project/discover", methods=["POST"])
+async def api_discover(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "project_root" not in body:
+        return JSONResponse({"error": "missing 'project_root'"}, status_code=400)
+    try:
+        result = rm.discover_project(body["project_root"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/project/initialize", methods=["POST"])
+async def api_initialize_project_folder(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "project_root" not in body:
+        return JSONResponse({"error": "missing 'project_root'"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(rm.initialize_project_folder, body["project_root"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/organizations", methods=["GET"])
+async def api_list_orgs(request: Request):
+    return JSONResponse(rm.list_orgs())
+
+
+@server.custom_route("/api/organizations", methods=["POST"])
+async def api_add_org(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "name" not in body:
+        return JSONResponse({"error": "missing 'name'"}, status_code=400)
+    try:
+        org = rm.add_org(body["name"])
+        return JSONResponse(org)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/organizations/{org_id}", methods=["DELETE"])
+async def api_delete_org(request: Request):
+    rm.remove_org(request.path_params["org_id"])
+    return JSONResponse({"ok": True})
+
+
+@server.custom_route("/api/projects", methods=["GET"])
+async def api_list_projects(request: Request):
+    return JSONResponse(rm.list_projects(request.query_params.get("org_id")))
+
+
+@server.custom_route("/api/projects", methods=["POST"])
+async def api_add_project(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    missing = [k for k in ("org_id", "name", "project_root", "deployment", "environment") if k not in body]
+    if missing:
+        return JSONResponse({"error": f"missing required field(s): {missing}"}, status_code=400)
+    try:
+        project = rm.add_project(
+            body["org_id"], body["name"], body["project_root"], body["deployment"], body["environment"]
+        )
+        return JSONResponse(project)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}", methods=["GET"])
+async def api_get_project(request: Request):
+    project = rm.get_project_view(request.path_params["project_id"])
+    if project is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(project)
+
+
+@server.custom_route("/api/projects/{project_id}", methods=["DELETE"])
+async def api_delete_project(request: Request):
+    rm.remove_project(request.path_params["project_id"])
+    return JSONResponse({"ok": True})
+
+
+@server.custom_route("/api/projects/{project_id}", methods=["PUT"])
+async def api_update_project(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    missing = [k for k in ("project_root", "deployment", "environment") if k not in body]
+    if missing:
+        return JSONResponse({"error": f"missing required field(s): {missing}"}, status_code=400)
+    try:
+        project = rm.update_project(
+            request.path_params["project_id"], body["project_root"], body["deployment"], body["environment"]
+        )
+        return JSONResponse(project)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/runs", methods=["DELETE"])
+async def api_clear_runs(request: Request):
+    try:
+        rm.clear_runs(request.path_params["project_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return JSONResponse({"ok": True})
+
+
+@server.custom_route("/api/projects/{project_id}/auth-check", methods=["GET"])
+async def api_auth_check(request: Request):
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.check_auth, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=404)
+
+
+@server.custom_route("/api/projects/{project_id}/init", methods=["POST"])
+async def api_init_project(request: Request):
+    try:
+        run = rm.init_project(request.path_params["project_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+    return JSONResponse({"run_id": run.id})
+
+
+@server.custom_route("/api/projects/{project_id}/fmt", methods=["POST"])
+async def api_fmt(request: Request):
+    """Reformats .tf/.tfvars in place. Takes no body -- there's no read-only
+    mode (see run_fmt)."""
+    try:
+        run = rm.run_fmt(request.path_params["project_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return JSONResponse({"run_id": run.id})
+
+
+@server.custom_route("/api/projects/{project_id}/validate", methods=["POST"])
+async def api_validate(request: Request):
+    try:
+        run = rm.run_validate(request.path_params["project_id"])
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return JSONResponse({"run_id": run.id})
+
+
+@server.custom_route("/api/projects/{project_id}/plan", methods=["POST"])
+async def api_plan(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    try:
+        run = rm.start_plan(
+            request.path_params["project_id"], body.get("name", ""), destroy=bool(body.get("destroy", False))
+        )
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+    return JSONResponse({"run_id": run.id})
+
+
+@server.custom_route("/api/runs", methods=["GET"])
+async def api_runs(request: Request):
+    project_id = request.query_params.get("project_id")
+    include_checks = request.query_params.get("include_checks") == "true"
+    return JSONResponse(rm.list_runs_summary(project_id, include_checks=include_checks))
+
+
+@server.custom_route("/api/runs/{run_id}", methods=["GET"])
+async def api_run_detail(request: Request):
+    run_id = request.path_params["run_id"]
+    r = rm.get_run(run_id)
+    if r is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+    return JSONResponse(r.to_dict(include_lines=True))
+
+
+@server.custom_route("/api/runs/{run_id}/cancel", methods=["POST"])
+async def api_cancel_run(request: Request):
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.cancel_run, request.path_params["run_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409)
+
+
+@server.custom_route("/api/runs/{run_id}/plan-diff", methods=["GET"])
+async def api_plan_diff(request: Request):
+    try:
+        result = await asyncio.to_thread(rm.get_plan_diff, request.path_params["run_id"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/runs/{run_id}/plan-diff/export", methods=["GET"])
+async def api_plan_diff_export(request: Request):
+    run_id = request.path_params["run_id"]
+    fmt = request.query_params.get("format", "json")
+    try:
+        diff = await asyncio.to_thread(rm.get_plan_diff, run_id)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+    short_id = run_id[:8]
+
+    if fmt == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["action", "address", "type", "name", "changed_fields"])
+        for rc in diff["resource_changes"]:
+            writer.writerow([rc["action"], rc["address"], rc["type"], rc["name"], "; ".join(rc["changed_fields"])])
+        return Response(
+            buf.getvalue(),
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="plan-diff-{short_id}.csv"'},
+        )
+
+    if fmt != "json":
+        return JSONResponse({"error": f"unknown format '{fmt}' -- use 'json' or 'csv'"}, status_code=400)
+
+    return Response(
+        json.dumps(diff, indent=2),
+        media_type="application/json",
+        headers={"Content-Disposition": f'attachment; filename="plan-diff-{short_id}.json"'},
+    )
+
+
+@server.custom_route("/api/runs/{run_id}/compare/{other_run_id}", methods=["GET"])
+async def api_compare_plans(request: Request):
+    try:
+        result = await asyncio.to_thread(
+            rm.compare_plans, request.path_params["run_id"], request.path_params["other_run_id"]
+        )
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/runs/{run_id}/stream", methods=["GET"])
+async def api_run_stream(request: Request):
+    run_id = request.path_params["run_id"]
+    r = rm.get_run(run_id)
+    if r is None:
+        return JSONResponse({"error": "not found"}, status_code=404)
+
+    q = r.subscribe()
+
+    async def event_gen():
+        while True:
+            line = await asyncio.to_thread(q.get)
+            if line is None:
+                yield "event: done\ndata: end\n\n"
+                break
+            safe = line.replace("\r", "")
+            yield f"data: {safe}\n\n"
+
+    return StreamingResponse(event_gen(), media_type="text/event-stream")
+
+
+@server.custom_route("/api/apply/request", methods=["POST"])
+async def api_apply_request(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "plan_run_id" not in body:
+        return JSONResponse({"error": "missing 'plan_run_id'"}, status_code=400)
+    try:
+        result = rm.request_apply_confirmation(body["plan_run_id"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/apply/confirm", methods=["POST"])
+async def api_apply_confirm(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "token" not in body:
+        return JSONResponse({"error": "missing 'token'"}, status_code=400)
+    try:
+        run = rm.confirm_apply(body["token"])
+        return JSONResponse({"run_id": run.id})
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+# ===================================================================================
+# SPA CATCH-ALL ROUTES -- /<org-name> and /<org-name>/<project-name>
+# ===================================================================================
+#
+# Registered LAST (custom_route appends in decoration order, and routes are
+# matched in that same order) so every exact-path route above -- app.js,
+# style.css, and all /api/* endpoints -- is always tried first. Only requests
+# that don't match any of those fall through to these single/double-segment
+# catch-alls, which is what makes /<org-name>/<project-name> work without an
+# /org/ prefix shadowing the dashboard's own static assets and API.
+
+
+@server.custom_route("/{org_name}", methods=["GET"])
+async def org_deep_link(request: Request):
+    """SPA fallback: /<org-name> is a client-side route (app.js reads the
+    path and opens that org's projects grid)."""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
+
+
+@server.custom_route("/{org_name}/{project_name}", methods=["GET"])
+async def project_deep_link(request: Request):
+    """SPA fallback: /<org-name>/<project-name> is a client-side route
+    (app.js reads the path and opens that project's workspace). Serving the
+    same shell here is what makes a direct navigation or a page refresh on
+    that URL work, instead of 404ing."""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
+
+
+app = server.streamable_http_app(host=HOST)
+
+
+if __name__ == "__main__":
+    rm.bootstrap()
+    print(f"IaC-Dashboard listening on http://{HOST}:{PORT}")
+    print(f"  Dashboard:  http://{HOST}:{PORT}/")
+    print(f"  MCP (HTTP): http://{HOST}:{PORT}/mcp")
+    uvicorn.run(app, host=HOST, port=PORT, log_level="info")
