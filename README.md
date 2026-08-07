@@ -18,8 +18,7 @@ saved organizations/projects, same run history, same in-progress lock).
 Every project belongs to an Organization -- create one first (there's nowhere
 else to put a project). Nothing about the target folder is hardcoded. A
 "project folder" is any folder that contains a `modules/` directory and one
-or more `tf-deployment*` directories (this repo's `IAC/` is one example, with
-`tf-deployments/` and `tf-deployment-rag/` inside it) -- either point at one
+or more `tf-deployment*` directories -- either point at one
 that already exists ("Select existing folder"), or have the dashboard
 generate a minimal starter one into an empty folder ("Initialize new folder",
 scaffolds `modules/` + `tf-deployment/main.tf` + placeholder
@@ -123,7 +122,8 @@ to disk.
 
 ## Wiring this up as an MCP server for Claude Code
 
-A project-scoped `.mcp.json` has already been added at the `IAC/` repo root:
+Add a `.mcp.json` at the root of the repo you want to drive from Claude Code
+(i.e. your Terraform project, not this one):
 
 ```json
 {
