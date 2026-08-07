@@ -40,8 +40,46 @@ Opening a project also runs that same check up front and shows the result as
 a pill in the title bar -- **Real Azure Change Activated** when you're
 authenticated, **Not Authenticated** (hover for the reason) when you're not --
 so a bad or missing login is visible immediately rather than only when a run
-fails. The
-`check_auth` MCP tool exposes the same probe without starting a run.
+fails. The `check_auth` MCP tool exposes the same probe without starting a run.
+
+## Getting started (new machine)
+
+Requirements:
+- **Windows**, with **PowerShell**. The folder picker (`.\start.ps1`/`.\stop.ps1`,
+  and cancelling a run) shell out to PowerShell/`taskkill`; there's no
+  Mac/Linux path today.
+- **Python 3.10+** on PATH.
+- **Terraform** on PATH.
+- **Azure CLI** (`az`) on PATH, logged in (`az login`) to the account that
+  should manage your infrastructure.
+
+Setup:
+
+```powershell
+git clone https://github.com/aatef14/IaC-Dashboard.git
+cd IaC-Dashboard
+pip install -r requirements.txt
+.\start.ps1
+```
+
+Then open http://127.0.0.1:8765/. First run creates `organizations.json`,
+`projects.json`, `runs.db`, and `project-data/` next to the code -- all
+git-ignored, all yours, nothing shared with anyone else who clones this repo.
+
+There's nothing to configure before first use: no config file, no
+environment variables, no storage account to pre-register. Everything --
+which folder, which deployment, which environment, which Azure subscription
+-- is supplied per-project the first time you click **Add Work Project**,
+either by pointing at Terraform code you already have or by having the
+dashboard scaffold a minimal starting point into an empty folder (see
+below). The one thing you bring yourself is a Terraform project shaped like
+the layout in "Expected folder structure" -- this dashboard drives
+`terraform`, it doesn't replace writing your own `.tf` files.
+
+Binds to `127.0.0.1` only, by design -- this can run `terraform apply`
+against real cloud infrastructure, and it has no authentication of its own.
+Never expose it beyond localhost; if several people need it, each runs their
+own instance against their own Azure login.
 
 ## Starting / stopping
 
