@@ -12,25 +12,25 @@
 
 :root {
   /* surfaces */
-  --bg-1: #f7f5ff;
-  --bg-2: #ece5fb;
+  --bg-1: #f5f8ff;
+  --bg-2: #e7f0fe;
   --surface: rgba(255, 255, 255, 0.72);
   --surface-strong: rgba(255, 255, 255, 0.88);
   --surface-solid: #ffffff;
-  --border: rgba(124, 58, 237, 0.14);
-  --border-strong: rgba(124, 58, 237, 0.28);
+  --border: rgba(37, 99, 235, 0.14);
+  --border-strong: rgba(37, 99, 235, 0.28);
 
   /* ink */
-  --text: #2a2140;
-  --muted: #7a6e96;
+  --text: #1c2333;
+  --muted: #6b7590;
 
   /* brand */
-  --brand: #7c3aed;
-  --brand-2: #a78bfa;
-  --brand-soft: #c8b1e4;
-  --brand-wash: #f3efff;
-  --brand-deep: #4c1d95;
-  --brand-ink: #2e1065;
+  --brand: #2563eb;
+  --brand-2: #60a5fa;
+  --brand-soft: #93c5fd;
+  --brand-wash: #eff6ff;
+  --brand-deep: #1d4ed8;
+  --brand-ink: #1e3a8a;
 
   /* semantic */
   --green: #0ea472;
@@ -47,25 +47,25 @@
   --warn-bg: rgba(217, 119, 6, 0.15);
   --rep-ink: #9a3412;
   --rep-bg: rgba(234, 88, 12, 0.15);
-  --neutral-bg: rgba(122, 110, 150, 0.15);
+  --neutral-bg: rgba(107, 117, 144, 0.15);
 
   /* translucent veils layered on top of a glass surface */
   --veil: rgba(255, 255, 255, 0.5);
   --veil-strong: rgba(255, 255, 255, 0.55);
   --glass-panel: rgba(255, 255, 255, 0.94);
   --glass-panel-edge: rgba(255, 255, 255, 0.7);
-  --overlay: rgba(46, 16, 101, 0.42);
+  --overlay: rgba(15, 23, 55, 0.42);
   --btn-hover-bg: #ffffff;
 
   /* gradients */
-  --grad-brand: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%);
-  --grad-rail: linear-gradient(170deg, #5b21b6 0%, #45148f 55%, #33096e 100%);
+  --grad-brand: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
+  --grad-rail: linear-gradient(170deg, #1e40af 0%, #1e3a8a 55%, #172554 100%);
   --grad-danger: linear-gradient(135deg, #f2585d 0%, #d42f36 100%);
 
   /* elevation */
-  --shadow-sm: 0 2px 8px rgba(76, 29, 149, 0.06);
-  --shadow: 0 10px 30px -12px rgba(76, 29, 149, 0.22);
-  --shadow-lg: 0 28px 60px -20px rgba(46, 16, 101, 0.38);
+  --shadow-sm: 0 2px 8px rgba(15, 23, 55, 0.06);
+  --shadow: 0 10px 30px -12px rgba(15, 23, 55, 0.22);
+  --shadow-lg: 0 28px 60px -20px rgba(15, 23, 55, 0.38);
 
   --r-sm: 10px;
   --r-md: 14px;
@@ -78,24 +78,29 @@
    Same variable contract, darker values -- everything downstream (glass
    surfaces, gradients, badges) is expressed in these vars, so the whole UI
    flips without any component-level dark overrides. */
+/* Structural surfaces/borders/text are neutral grey -- purple is reserved
+   for actual accents (primary buttons, the active tab, the apply
+   confirmation code, links, focus/selection) rather than tinting every
+   panel and border, which read as "everything is purple" rather than "this
+   app has a purple accent". */
 :root[data-theme="dark"] {
-  --bg-1: #14101f;
-  --bg-2: #0e0b17;
-  --surface: rgba(45, 34, 71, 0.58);
-  --surface-strong: rgba(38, 29, 61, 0.82);
-  --surface-solid: #241b3c;
-  --border: rgba(167, 139, 250, 0.18);
-  --border-strong: rgba(167, 139, 250, 0.34);
+  --bg-1: #15161b;
+  --bg-2: #0d0e11;
+  --surface: rgba(38, 39, 46, 0.6);
+  --surface-strong: rgba(30, 31, 37, 0.85);
+  --surface-solid: #1e1f25;
+  --border: rgba(255, 255, 255, 0.09);
+  --border-strong: rgba(255, 255, 255, 0.17);
 
-  --text: #ece8f8;
-  --muted: #a99fc4;
+  --text: #e7e7ec;
+  --muted: #98989f;
 
-  --brand: #a78bfa;
-  --brand-2: #c4b5fd;
-  --brand-soft: #ddd0f5;
-  --brand-wash: rgba(139, 92, 246, 0.14);
-  --brand-deep: #d6c9fb;
-  --brand-ink: #f2eeff;
+  --brand: #60a5fa;
+  --brand-2: #93c5fd;
+  --brand-soft: #bfdbfe;
+  --brand-wash: rgba(255, 255, 255, 0.07);
+  --brand-deep: #93c5fd;
+  --brand-ink: #f1f1f4;
 
   --green: #34d399;
   --red: #ff7b7f;
@@ -109,16 +114,16 @@
   --warn-bg: rgba(217, 119, 6, 0.24);
   --rep-ink: #fdba74;
   --rep-bg: rgba(234, 88, 12, 0.22);
-  --neutral-bg: rgba(169, 159, 196, 0.18);
+  --neutral-bg: rgba(255, 255, 255, 0.09);
 
   --veil: rgba(255, 255, 255, 0.03);
   --veil-strong: rgba(255, 255, 255, 0.04);
-  --glass-panel: rgba(38, 29, 61, 0.95);
-  --glass-panel-edge: rgba(167, 139, 250, 0.22);
-  --overlay: rgba(8, 5, 16, 0.66);
-  --btn-hover-bg: rgba(139, 92, 246, 0.16);
+  --glass-panel: rgba(30, 31, 37, 0.96);
+  --glass-panel-edge: rgba(255, 255, 255, 0.14);
+  --overlay: rgba(5, 5, 7, 0.66);
+  --btn-hover-bg: rgba(255, 255, 255, 0.08);
 
-  --grad-brand: linear-gradient(135deg, #8b5cf6 0%, #6d28d9 100%);
+  --grad-brand: linear-gradient(135deg, #3b82f6 0%, #1d4ed8 100%);
   --grad-danger: linear-gradient(135deg, #e5484d 0%, #b8232a 100%);
 
   --shadow-sm: 0 2px 8px rgba(0, 0, 0, 0.3);
@@ -137,25 +142,29 @@ body {
   flex-direction: column;
   background: var(--bg-1);
   background-image:
-    radial-gradient(900px 520px at 12% -8%, rgba(167, 139, 250, 0.34), transparent 62%),
-    radial-gradient(760px 480px at 98% 4%, rgba(124, 58, 237, 0.20), transparent 60%),
-    radial-gradient(680px 520px at 72% 104%, rgba(200, 177, 228, 0.34), transparent 62%),
+    radial-gradient(900px 520px at 12% -8%, rgba(96, 165, 250, 0.34), transparent 62%),
+    radial-gradient(760px 480px at 98% 4%, rgba(37, 99, 235, 0.20), transparent 60%),
+    radial-gradient(680px 520px at 72% 104%, rgba(147, 197, 253, 0.34), transparent 62%),
     linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
   background-attachment: fixed;
   -webkit-font-smoothing: antialiased;
   transition: background-color 0.3s ease, color 0.3s ease;
 }
+/* A muted, mostly-neutral wash instead of light mode's full-strength purple
+   blooms -- this sits behind every screen, so it was the single biggest
+   reason dark mode read as "everything is purple" rather than "a dark
+   theme with a purple accent". */
 :root[data-theme="dark"] body {
   background-image:
-    radial-gradient(900px 520px at 12% -8%, rgba(124, 58, 237, 0.34), transparent 62%),
-    radial-gradient(760px 480px at 98% 4%, rgba(76, 29, 149, 0.42), transparent 60%),
-    radial-gradient(680px 520px at 72% 104%, rgba(91, 33, 182, 0.32), transparent 62%),
+    radial-gradient(900px 520px at 12% -8%, rgba(37, 99, 235, 0.1), transparent 62%),
+    radial-gradient(760px 480px at 98% 4%, rgba(255, 255, 255, 0.03), transparent 60%),
+    radial-gradient(680px 520px at 72% 104%, rgba(37, 99, 235, 0.06), transparent 62%),
     linear-gradient(180deg, var(--bg-1) 0%, var(--bg-2) 100%);
 }
 
 .hidden { display: none !important; }
 
-::selection { background: rgba(139, 92, 246, 0.24); }
+::selection { background: rgba(37, 99, 235, 0.24); }
 
 /* ---------- view transitions ----------
    app.js adds .view-enter to whichever top-level view it just revealed
@@ -233,11 +242,11 @@ body {
   transition: background-color 0.4s ease;
 }
 .scrolling::-webkit-scrollbar-thumb {
-  background: rgba(124, 58, 237, 0.34);
+  background: rgba(37, 99, 235, 0.34);
   background-clip: content-box;
 }
 .scrolling::-webkit-scrollbar-thumb:hover {
-  background: rgba(124, 58, 237, 0.55);
+  background: rgba(37, 99, 235, 0.55);
   background-clip: content-box;
 }
 /* the log is a dark slab -- needs a light thumb to be visible on it */
@@ -349,7 +358,7 @@ h1 {
   border-color: var(--brand);
   background: var(--btn-hover-bg);
   transform: translateY(-1px);
-  box-shadow: 0 8px 20px -8px rgba(109, 40, 217, 0.34);
+  box-shadow: 0 8px 20px -8px rgba(29, 78, 216, 0.34);
 }
 .btn:active:not(:disabled) { transform: translateY(0); }
 .btn:focus-visible { outline: 2px solid var(--brand-2); outline-offset: 2px; }
@@ -359,7 +368,7 @@ h1 {
   color: #fff;
   border-color: transparent;
   font-weight: 650;
-  box-shadow: 0 10px 24px -10px rgba(109, 40, 217, 0.7);
+  box-shadow: 0 10px 24px -10px rgba(29, 78, 216, 0.7);
 }
 .btn.primary:hover:not(:disabled) { filter: brightness(1.07); background: var(--grad-brand); }
 
@@ -462,7 +471,7 @@ h1 {
 .project-card:hover {
   transform: translateY(-3px);
   border-color: var(--border-strong);
-  box-shadow: 0 22px 48px -18px rgba(76, 29, 149, 0.36);
+  box-shadow: 0 22px 48px -18px rgba(15, 23, 55, 0.36);
 }
 .project-card:hover::before { opacity: 1; }
 
@@ -594,6 +603,7 @@ h1 {
   color: var(--brand-ink);
 }
 #workspace-title-bar .pills { display: flex; gap: 8px; flex-wrap: wrap; }
+#btn-open-vscode { margin-left: auto; }
 
 #workspace-body {
   flex: 1;
@@ -793,16 +803,16 @@ h1 {
   font-size: 12.5px;
   white-space: pre-wrap;
   word-break: break-word;
-  background: linear-gradient(180deg, #241a3d 0%, #1c1430 100%);
-  color: #ded6f5;
+  background: linear-gradient(180deg, #1a2340 0%, #131a30 100%);
+  color: #d7e3fb;
   border-radius: var(--r-md);
-  border: 1px solid rgba(124, 58, 237, 0.3);
+  border: 1px solid rgba(37, 99, 235, 0.3);
   box-shadow: inset 0 2px 14px rgba(0, 0, 0, 0.34);
 }
 
 #plan-diff-container { flex: 1; overflow-y: auto; padding: 4px 20px 18px; }
 
-#plan-view-toolbar {
+#plan-view-toolbar, #progress-toolbar {
   display: flex;
   justify-content: space-between;
   align-items: center;
@@ -842,7 +852,7 @@ h1 {
 }
 #plan-diff-table td, #compare-results-table td {
   padding: 10px 13px;
-  border-bottom: 1px solid rgba(124, 58, 237, 0.08);
+  border-bottom: 1px solid rgba(37, 99, 235, 0.08);
   vertical-align: top;
 }
 #plan-diff-table tbody tr:last-child td,
@@ -878,9 +888,235 @@ h1 {
 }
 .action-badge.create { background: rgba(14, 164, 114, 0.15); color: var(--ok-ink); }
 .action-badge.update { background: var(--warn-bg); color: var(--warn-ink); }
-.action-badge.delete { background: var(--err-bg); color: var(--err-ink); }
+.action-badge.delete, .action-badge.destroy { background: var(--err-bg); color: var(--err-ink); }
 .action-badge.replace { background: var(--rep-bg); color: var(--rep-ink); }
-.action-badge.read { background: rgba(124, 58, 237, 0.14); color: var(--brand-deep); }
+.action-badge.read { background: rgba(37, 99, 235, 0.14); color: var(--brand-deep); }
+.action-badge.refresh, .action-badge.other { background: var(--neutral-bg); color: var(--muted); }
+
+/* ---------- live apply/plan progress checklist ----------
+   Parsed client-side from terraform's own "X: Creating..." / "Still
+   creating... [10s elapsed]" / "Creation complete after 1m8s" lines --
+   turns the scrolling raw log into a per-resource checklist while a run is
+   in flight (see parseProgressLine in app.js). */
+
+#progress-list {
+  flex: 1;
+  overflow-y: auto;
+  margin: 4px 20px 18px;
+  padding: 6px 10px;
+  list-style: none;
+  background: var(--surface-solid);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+}
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 10px 10px;
+  border-bottom: 1px solid rgba(37, 99, 235, 0.08);
+  font-size: 12.5px;
+}
+.progress-row:last-child { border-bottom: none; }
+
+.progress-icon {
+  width: 18px;
+  height: 18px;
+  flex: none;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  color: #fff;
+}
+.progress-row.running .progress-icon {
+  background: transparent;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--brand);
+  animation: progress-spin 0.8s linear infinite;
+}
+.progress-row.done.kind-create .progress-icon { background: linear-gradient(135deg, #34d399, #0ea472); }
+.progress-row.done.kind-update .progress-icon { background: linear-gradient(135deg, #fbbf24, #d97706); }
+.progress-row.done.kind-destroy .progress-icon { background: var(--grad-danger); }
+.progress-row.done.kind-read .progress-icon,
+.progress-row.done.kind-refresh .progress-icon,
+.progress-row.done.kind-other .progress-icon { background: var(--grad-brand); }
+
+@keyframes progress-spin {
+  to { transform: rotate(360deg); }
+}
+
+.progress-address {
+  flex: 1;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  color: var(--brand-ink);
+  overflow-wrap: anywhere;
+}
+.progress-detail {
+  flex: none;
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+
+/* ---------- diagnostic blocks (terraform "Error:"/"Warning:" output) ----------
+   #log's raw text is parsed client-side into plain-text runs plus these
+   structured cards for any "Error: <summary>" / "Warning: <summary>" block
+   (see parseLogBlocks in app.js) -- the same box terraform itself prints,
+   just no longer a wall of monochrome text the failure is buried in. */
+
+.log-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+  display: block;
+}
+
+/* #log's own background is a fixed dark navy gradient REGARDLESS of the
+   page theme (it's a "terminal", meant to look like one in light mode too)
+   -- every color in here is therefore a fixed value calibrated for that
+   dark background, deliberately not any of the page's light/dark theme
+   vars. Diag-title/location/detail used to pull var(--err-ink)/var(--muted)/
+   var(--text), which are calibrated for the (light OR dark) *page*
+   background -- in light mode that meant near-black text landing on this
+   permanently-dark panel, unreadable. */
+.diag-block {
+  margin: 10px 0;
+  padding: 13px 16px;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(229, 72, 77, 0.35);
+  background: rgba(229, 72, 77, 0.16);
+}
+.diag-block.warning { border-color: rgba(217, 119, 6, 0.4); background: rgba(217, 119, 6, 0.16); }
+
+.diag-head { display: flex; align-items: center; gap: 9px; font-family: "Segoe UI", sans-serif; }
+.diag-icon {
+  width: 19px;
+  height: 19px;
+  flex: none;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 800;
+  color: #fff;
+  background: var(--grad-danger);
+}
+.diag-block.warning .diag-icon { background: linear-gradient(135deg, #fbbf24, #d97706); }
+.diag-title { font-weight: 750; font-size: 13.5px; color: #ffa6a9; }
+.diag-block.warning .diag-title { color: #fcd34d; }
+
+.diag-location {
+  margin: 8px 0 0 28px;
+  font-family: "Segoe UI", sans-serif;
+  font-size: 12px;
+  color: #9a9aa6;
+}
+.diag-file { font-family: "Cascadia Mono", Consolas, monospace; color: #93c5fd; }
+
+.diag-code {
+  margin: 8px 0 0 28px;
+  padding: 9px 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: rgba(0, 0, 0, 0.22);
+  border-radius: 7px;
+  border-left: 3px solid rgba(229, 72, 77, 0.6);
+  font-size: 12px;
+}
+.diag-block.warning .diag-code { border-left-color: rgba(217, 119, 6, 0.6); }
+.diag-code-line { display: block; }
+.diag-code-lineno { display: inline-block; min-width: 30px; color: #8a93ab; user-select: none; }
+.diag-code-src { color: #d7e3fb; }
+
+.diag-detail {
+  margin: 8px 0 0 28px;
+  font-family: "Segoe UI", sans-serif;
+  font-size: 12.5px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  color: #d7e3fb;
+}
+
+/* ---------- tfvars pretty-config tree ----------
+   Parsed server-side (parse_tfvars in run_manager.py) into real nested
+   dict/list/str/number/bool/None values -- rendered here as a collapsible
+   tree instead of raw HCL text with comments and alignment whitespace. */
+
+.mono-path { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; word-break: break-all; }
+
+#tfvars-toolbar { display: flex; justify-content: flex-end; margin: 4px 0 10px; }
+
+.tfv-tree {
+  max-height: 55vh;
+  overflow-y: auto;
+  padding: 10px 14px;
+  background: var(--surface-solid);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-sm);
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12.5px;
+}
+
+.tfv-row {
+  padding: 3px 0;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  flex-wrap: wrap;
+}
+
+.tfv-node { margin: 1px 0; }
+.tfv-node > summary {
+  cursor: pointer;
+  list-style: none;
+  padding: 3px 0;
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+}
+.tfv-node > summary::-webkit-details-marker { display: none; }
+.tfv-node > summary::before {
+  content: "\25B8"; /* ▸ */
+  display: inline-block;
+  color: var(--brand-2);
+  font-size: 10px;
+  width: 11px;
+  transition: transform 0.12s ease;
+}
+.tfv-node[open] > summary::before { transform: rotate(90deg); }
+
+.tfv-children {
+  margin-left: 15px;
+  padding-left: 11px;
+  border-left: 1px solid var(--border);
+}
+
+.tfv-key { color: var(--brand-ink); font-weight: 650; }
+.tfv-eq { color: var(--muted); }
+.tfv-type { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
+.tfv-string { color: var(--green); }
+.tfv-number { color: var(--brand-deep); }
+.tfv-bool { color: var(--amber); }
+.tfv-null, .tfv-ref { color: var(--muted); font-style: italic; }
+
+#tfvars-raw {
+  max-height: 55vh;
+  overflow-y: auto;
+  margin: 0;
+  padding: 14px 16px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  background: linear-gradient(180deg, #1a2340 0%, #131a30 100%);
+  color: #d7e3fb;
+  border-radius: var(--r-md);
+  border: 1px solid rgba(37, 99, 235, 0.3);
+}
 
 .status-badge {
   display: inline-block;
@@ -895,7 +1131,7 @@ h1 {
 .status-badge.added_in_newer_plan { background: rgba(14, 164, 114, 0.15); color: var(--ok-ink); }
 .status-badge.removed_in_newer_plan { background: var(--neutral-bg); color: var(--muted); }
 .status-badge.action_changed { background: var(--warn-bg); color: var(--warn-ink); }
-.status-badge.changed_fields_differ { background: rgba(124, 58, 237, 0.15); color: var(--brand-deep); }
+.status-badge.changed_fields_differ { background: rgba(37, 99, 235, 0.15); color: var(--brand-deep); }
 
 .diff-row { cursor: pointer; transition: background 0.12s ease; }
 .diff-row:hover { background: var(--brand-wash); }
@@ -955,7 +1191,7 @@ h1 {
   padding: 7px 16px;
   border-radius: var(--r-md);
   letter-spacing: 0.16em;
-  box-shadow: 0 8px 20px -8px rgba(109, 40, 217, 0.6);
+  box-shadow: 0 8px 20px -8px rgba(29, 78, 216, 0.6);
 }
 
 /* ---------- inputs ---------- */
@@ -974,7 +1210,7 @@ input::placeholder { color: rgba(122, 110, 150, 0.62); }
 input:focus, select:focus {
   outline: none;
   border-color: var(--brand);
-  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.18);
+  box-shadow: 0 0 0 3px rgba(96, 165, 250, 0.18);
 }
 select {
   cursor: pointer;
@@ -1046,9 +1282,9 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
 .modal-wide { width: 680px; }
 
 .folder-tree {
-  background: linear-gradient(180deg, #241a3d 0%, #1c1430 100%);
-  color: #ded6f5;
-  border: 1px solid rgba(124, 58, 237, 0.34);
+  background: linear-gradient(180deg, #1a2340 0%, #131a30 100%);
+  color: #d7e3fb;
+  border: 1px solid rgba(37, 99, 235, 0.34);
   border-radius: var(--r-md);
   padding: 15px 17px;
   font-family: "Cascadia Mono", Consolas, monospace;
@@ -1102,10 +1338,10 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
 .tab.active {
   color: #fff;
   background: var(--grad-brand);
-  box-shadow: 0 6px 16px -7px rgba(109, 40, 217, 0.7);
+  box-shadow: 0 6px 16px -7px rgba(29, 78, 216, 0.7);
 }
 
-#new-folder-hint { font-size: 12px; margin: 8px 0 12px; color: var(--muted); line-height: 1.6; }
+#new-folder-hint, .retention-hint { font-size: 12px; margin: 8px 0 12px; color: var(--muted); line-height: 1.6; }
 
 .modal-actions { display: flex; justify-content: flex-end; gap: 11px; margin-top: 24px; }
 
@@ -1131,7 +1367,7 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
 .compare-picker-list li:hover {
   border-color: var(--brand);
   transform: translateX(3px);
-  box-shadow: 0 8px 18px -10px rgba(109, 40, 217, 0.4);
+  box-shadow: 0 8px 18px -10px rgba(29, 78, 216, 0.4);
 }
 .compare-picker-list .run-name { font-weight: 700; color: var(--brand-ink); }
 .compare-picker-list .muted { display: block; font-size: 11px; margin-top: 3px; }
@@ -1140,6 +1376,13 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
    Replaces the native `title` tooltip, which ignored the theme entirely and
    rendered paths in a tiny OS-grey box. Any element with data-tip gets this
    instead (see the tooltip engine in app.js). */
+
+/* Plain text spans (pills, etc.) default to the text-selection I-beam cursor
+   on hover -- override to a pointer so a tooltip trigger reads as
+   hoverable/interactive rather than editable text. */
+[data-tip] {
+  cursor: pointer;
+}
 
 #tooltip {
   position: fixed;
@@ -1191,6 +1434,30 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
   word-break: break-all;
 }
 #tooltip .tip-spacer { height: 7px; }
+
+/* "Label: value" lines (auth-check details, mostly) -- label stacked above
+   its value in small dim caps so a field name is never mistaken for the
+   value it's reporting, even when either one runs long (GUIDs, file paths). */
+#tooltip .tip-kv {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 3px 0;
+}
+#tooltip .tip-kv + .tip-kv { border-top: 1px solid var(--border); padding-top: 4px; }
+#tooltip .tip-key {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+#tooltip .tip-val {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--brand-ink);
+  word-break: break-word;
+}
 
 /* ---------- toasts ---------- */
 

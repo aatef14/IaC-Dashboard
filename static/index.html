@@ -12,6 +12,7 @@
       <h1>IaC-Dashboard</h1>
     </div>
     <div class="header-right">
+      <button id="btn-restart-server" class="btn danger-outline" data-tip="Restart the dashboard server&#10;Kills and relaunches this whole process (via stop.ps1/start.ps1).&#10;Interrupts any run currently in flight, for any project.">Restart Server</button>
       <button id="btn-theme" class="btn" data-tip="Toggle dark mode" aria-label="Toggle dark mode">
         <span class="theme-icon"></span>
       </button>
@@ -46,6 +47,7 @@
     <div id="workspace-title-bar">
       <h2 id="workspace-project-name"></h2>
       <div class="pills" id="workspace-pills"></div>
+      <button id="btn-open-vscode" class="btn" data-tip="Open this project's root folder in VS Code, on this same machine.&#10;The root, not just the deployment folder -- so modules/ (referenced by relative path) is visible alongside it.&#10;Requires the 'code' command on PATH (VS Code Command Palette -&gt; &quot;Shell Command: Install 'code' command in PATH&quot;).">Open in VS Code</button>
     </div>
 
     <div id="workspace-body">
@@ -55,6 +57,7 @@
         <button id="btn-fmt" class="btn" data-tip="Format&#10;Runs terraform fmt -recursive, rewriting .tf/.tfvars files in place.&#10;Whitespace and alignment only -- never changes what the config means.">Format</button>
         <button id="btn-validate" class="btn" disabled>Validate</button>
       </div>
+      <button id="btn-view-tfvars" class="btn full-width" data-tip="View this project's tfvars file parsed into a readable tree, instead of raw HCL text.">View Config (tfvars)</button>
       <label class="field-label">Plan name</label>
       <input id="plan-name-input" placeholder="e.g. before refactor" />
       <div class="btn-row">
@@ -91,7 +94,15 @@
         </table>
       </div>
 
-      <pre id="log"></pre>
+      <div id="progress-toolbar" class="hidden">
+        <span id="progress-counts"></span>
+        <div class="toolbar-actions">
+          <button id="btn-toggle-progress-log" class="btn">Show raw log</button>
+        </div>
+      </div>
+      <ul id="progress-list" class="hidden"></ul>
+
+      <div id="log"></div>
 
       <div id="action-bar">
         <div id="plan-summary" class="hidden">
@@ -210,7 +221,7 @@
       <h2 id="add-project-modal-title">Add Work Project</h2>
 
       <label class="field-label">Name</label>
-      <input id="project-name-input" placeholder="e.g. QISP RAG sandbox" />
+      <input id="project-name-input" placeholder="e.g. QISP-RAG-sandbox (no spaces)" />
 
       <div id="folder-mode-tabs" class="tabs">
         <button type="button" id="tab-existing-folder" class="tab active" data-mode="existing">Select existing folder</button>
@@ -234,6 +245,10 @@
         <select id="environment-select"></select>
       </div>
 
+      <label class="field-label">Run retention (days)</label>
+      <input id="retention-days-input" type="number" min="0" step="1" placeholder="blank = keep forever" />
+      <p class="muted retention-hint">Finished init/plan/apply runs older than this are deleted automatically (checked after every run and on server startup). Leave blank to keep run history forever.</p>
+
       <div id="add-project-error" class="warn-text hidden"></div>
 
       <div class="modal-actions">
@@ -245,7 +260,7 @@
     <div id="add-org-modal" class="modal hidden">
       <h2>New Organization</h2>
       <label class="field-label">Name</label>
-      <input id="org-name-input" placeholder="e.g. Acme Corp" />
+      <input id="org-name-input" placeholder="e.g. Acme-Corp (no spaces)" />
       <div id="add-org-error" class="warn-text hidden"></div>
       <div class="modal-actions">
         <button class="btn modal-close">Cancel</button>
@@ -278,6 +293,20 @@
         <thead><tr><th>Status</th><th>Resource</th><th>Detail</th></tr></thead>
         <tbody></tbody>
       </table>
+      <div class="modal-actions">
+        <button class="btn modal-close">Close</button>
+      </div>
+    </div>
+
+    <div id="tfvars-modal" class="modal modal-wide hidden">
+      <h2>Config (tfvars)</h2>
+      <p id="tfvars-path" class="muted mono-path"></p>
+      <div id="tfvars-toolbar" class="hidden">
+        <button id="btn-toggle-tfvars-raw" class="btn">Show raw file</button>
+      </div>
+      <p id="tfvars-error" class="warn-text hidden"></p>
+      <div id="tfvars-tree" class="tfv-tree"></div>
+      <pre id="tfvars-raw" class="hidden"></pre>
       <div class="modal-actions">
         <button class="btn modal-close">Close</button>
       </div>

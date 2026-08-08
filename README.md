@@ -45,13 +45,19 @@ fails. The `check_auth` MCP tool exposes the same probe without starting a run.
 ## Getting started (new machine)
 
 Requirements:
-- **Windows**, with **PowerShell**. The folder picker (`.\start.ps1`/`.\stop.ps1`,
-  and cancelling a run) shell out to PowerShell/`taskkill`; there's no
-  Mac/Linux path today.
+- **Windows**, with **PowerShell** -- the native folder picker, the
+  Restart Server button, and `.\start.ps1`/`.\stop.ps1` themselves all shell
+  out to PowerShell/`taskkill`. Not on Windows (or want it running somewhere
+  other than your own desktop)? See **Running with Docker** below instead --
+  those two features just fail with a clear message there rather than
+  working, everything else is identical.
 - **Python 3.10+** on PATH.
 - **Terraform** on PATH.
 - **Azure CLI** (`az`) on PATH, logged in (`az login`) to the account that
   should manage your infrastructure.
+- **VS Code's `code` CLI** on PATH, only if you want to use the **Open in
+  VS Code** button (VS Code's Command Palette ->
+  "Shell Command: Install 'code' command in PATH" if it isn't already there).
 
 Setup:
 
@@ -93,21 +99,69 @@ Runs detached in the background so it survives closing the terminal.
 Logs land in `server.log` / `server.log.err` in this folder. To run it in the
 foreground instead (e.g. while debugging): `python server.py`.
 
+## Running with Docker
+
+An alternative to the native Windows setup above -- useful for running this
+somewhere other than your own desktop (e.g. a shared box a small team uses).
+Two things that need a real Windows desktop to work at all fail with a clear
+message instead of a confusing one when running in a container:
+
+- **Browse...** (the native folder picker) -- type the project path directly
+  (e.g. a path under a volume you've mounted, like `/workspace/my-repo`).
+- **Restart Server** -- restart the container instead:
+  `docker compose restart`.
+
+```bash
+git clone https://github.com/aatef14/IaC-Dashboard.git
+cd IaC-Dashboard
+# Point this at wherever your actual Terraform project(s) live on the host
+mkdir -p terraform-projects
+docker compose up -d --build
+```
+
+Then open http://127.0.0.1:8765/ -- same dashboard, same MCP endpoint. Two
+volumes matter here (see `docker-compose.yml`):
+
+- `dashboard-data` (a named volume, `/data` in the container) -- holds
+  `organizations.json`/`projects.json`/`runs.db`/`project-data/`, so a
+  rebuild doesn't wipe your saved projects and run history.
+- `./terraform-projects` (a bind mount, `/workspace` in the container) --
+  put (or symlink) your real Terraform repo(s) here, then point **Add Work
+  Project** at the matching path under `/workspace`.
+
+`docker-compose.yml` publishes the port as `127.0.0.1:8765:8765`, not a bare
+`8765:8765` -- same "never reachable off this machine" guarantee as the
+native app's `127.0.0.1` bind, just re-established at the Docker layer
+instead (binding to `127.0.0.1` *inside* a container would make it
+unreachable from the host entirely, so the image binds `0.0.0.0` internally
+and the port mapping is what actually restricts it to localhost).
+
 ## Using it
 
-1. **New Organization** on the landing page -- give it a name. Open it.
-2. **Add Work Project** -- give it a name (permanent -- see below), then
-   either **Select existing folder** (Browse to it, Scan Folder) or **Initialize new folder** (Browse to an empty folder,
+1. **New Organization** on the landing page -- give it a name (no spaces --
+   it's the stable key `/<org-name>/<project-name>` URLs are built on). Open it.
+2. **Add Work Project** -- give it a name (also no spaces, also permanent --
+   see below), then either **Select existing folder** (Browse to it, Scan
+   Folder) or **Initialize new folder** (Browse to an empty folder,
    Initialize Folder -- generates starter files you still need to fill in
    with real values). Pick deployment + environment, Create Project. This
    saves it and runs `terraform init` automatically.
-3. Open the project card. **Format** and **Validate** are local,
-   no-cloud-calls actions. Format runs `terraform fmt -recursive`, rewriting
-   any badly-formatted `.tf`/`.tfvars` files in place (whitespace and
-   alignment only, never meaning) and reporting which ones it touched.
-   Because it's recursive, `environmentVariables/*.tfvars` is covered --
-   but `backend/*.tfbackend` is not, since Terraform doesn't recognize that
-   extension.
+3. Open the project card. **Open in VS Code** launches VS Code (the `code`
+   CLI) on this same machine, pointed at the project's ROOT folder (not just
+   the deployment subfolder -- that would hide the sibling `modules/`
+   directory its `.tf` files actually reference by relative path) -- needs
+   `code` on PATH (VS Code's Command Palette ->
+   "Shell Command: Install 'code' command in PATH" if it isn't yet).
+   **Format** and **Validate** are local, no-cloud-calls actions. Format
+   runs `terraform fmt -recursive`, rewriting any badly-formatted
+   `.tf`/`.tfvars` files in place (whitespace and alignment only, never
+   meaning) and reporting which ones it touched. Because it's recursive,
+   `environmentVariables/*.tfvars` is covered -- but `backend/*.tfbackend`
+   is not, since Terraform doesn't recognize that extension. **View Config
+   (tfvars)** shows that environment's tfvars file parsed into a readable,
+   collapsible tree instead of raw HCL -- it live-refreshes while open, so
+   edits made outside the dashboard (in an editor, or by Format) show up
+   without needing to reopen it.
 4. **Run Plan** (name it) and watch it stream, or **Plan Destroy** to plan
    tearing the whole deployment down instead (still just a plan -- see
    Apply safety below). A successful plan shows a structured
@@ -182,15 +236,35 @@ at session start, and you'll get a one-time approval prompt for a new server.
 Tools exposed: `list_organizations`, `add_organization`, `delete_organization`,
 `list_projects`, `discover_project`, `initialize_project_folder`,
 `add_project`, `update_project`, `delete_project`, `clear_project_runs`,
-`check_auth`, `init_project`, `fmt`, `validate`, `terraform_plan`, `plan_destroy`,
-`get_plan_diff`, `compare_plans`, `request_apply`, `confirm_apply`,
+`check_auth`, `get_tfvars`, `init_project`, `fmt`, `validate`, `terraform_plan`,
+`plan_destroy`, `get_plan_diff`, `compare_plans`, `request_apply`, `confirm_apply`,
 `cancel_run`, `get_run_status`, `list_runs`. Claude is instructed to check
 `list_organizations` first (creating one via `add_organization` if none
 exist), then `list_projects(org_id)`, add one via `discover_project` or
 `initialize_project_folder` + `add_project` if needed (asking which
 deployment/environment/cloud provider if there's more than one option),
 `init_project` before planning, and to always show you the plan summary and
-get an explicit yes before calling `confirm_apply`.
+get an explicit yes before calling `confirm_apply`. Two dashboard buttons are
+deliberately NOT MCP tools -- **Restart Server** and **Open in VS Code** --
+both act on the host machine's desktop/process in a way that should only
+ever be a human clicking a button, never an agent deciding to do it.
+
+## Other dashboard features
+
+- **Run retention** -- each project can optionally set a "keep runs for N
+  days" limit (Add/Edit Work Project). Finished init/plan/apply runs older
+  than that are deleted automatically (checked after every run and at
+  startup); unset (the default) keeps run history forever, unchanged from
+  before this existed.
+- **Restart Server** (top-right corner) -- restarts the whole dashboard
+  process via `stop.ps1`/`start.ps1`, warning first if it would interrupt a
+  run in progress. Windows-only; in Docker, restart the container instead.
+- Terraform's own `Error:`/`Warning:` diagnostic output renders as
+  color-coded cards (location, offending line, message) instead of a raw
+  text dump, and a live per-resource progress checklist (✓/spinner, action,
+  elapsed/duration) appears during a running plan/apply instead of a wall
+  of interleaved "Still creating... [10s elapsed]" lines -- toggle back to
+  the raw log any time.
 
 ## Files
 
@@ -204,6 +278,7 @@ get an explicit yes before calling `confirm_apply`.
 | `project-data/<project_id>/runs/<run_id>/` | Everything one plan run produced (`plan.tfplan`, `diff.json`) -- lives here, NOT inside the actual Terraform repo, so the dashboard never writes anything into your IaC project folder |
 | `static/` | Dashboard HTML/CSS/JS |
 | `start.ps1` / `stop.ps1` | Background process management (PID tracked in `.server.pid`) |
+| `Dockerfile` / `docker-compose.yml` / `.dockerignore` | Container image (Python + Terraform + Azure CLI) -- see **Running with Docker** above |
 
 ## Known limitations
 
@@ -223,8 +298,11 @@ get an explicit yes before calling `confirm_apply`.
   project would have passed its auth check and then died fetching an Azure
   storage key.
 - A running init/plan/apply can be **cancelled** from the run header (or the
-  `cancel_run` MCP tool), which kills the whole terraform process tree and
-  frees the per-project lock. Safe for init/fmt/validate/plan. Cancelling an
-  **apply** is risky and warns accordingly -- resources may already be
+  `cancel_run` MCP tool). On Windows this kills the whole terraform process
+  tree via `taskkill`; running in Docker/Linux it only kills the immediate
+  `terraform` process, not the provider plugin children it spawned (a
+  Linux process-group-kill equivalent isn't implemented yet). Safe for
+  init/fmt/validate/plan either way. Cancelling an **apply** is risky and
+  warns accordingly regardless of platform -- resources may already be
   half-created and the state file can be left locked (needing
   `terraform force-unlock`).

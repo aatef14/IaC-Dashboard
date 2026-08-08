@@ -13,7 +13,11 @@ import os
 import sqlite3
 import threading
 
-DB_FILE = os.path.join(os.path.dirname(__file__), "runs.db")
+# Same DATA_DIR override as run_manager.py -- see its comment. Both must
+# agree on where state lives, so runs.db ends up on the same volume as
+# projects.json/organizations.json rather than split across two locations.
+DATA_DIR = os.environ.get("IAC_DASHBOARD_DATA_DIR", os.path.dirname(__file__))
+DB_FILE = os.path.join(DATA_DIR, "runs.db")
 
 _lock = threading.Lock()
 _conn: sqlite3.Connection | None = None
@@ -88,10 +92,15 @@ def save_run(run) -> None:
 
 def load_all_runs() -> list[dict]:
     """Return every persisted run as a plain dict (caller reconstructs Run
-    objects with it). Any run still marked 'running' is a leftover from a
-    server process that died mid-run -- there's no way to actually recover
-    it, so it's surfaced with status forced to 'failed' plus a note, not
-    silently left looking like it's still going."""
+    objects with it). Any run still marked 'running' OR 'queued' is a
+    leftover from a server process that died (or was restarted) mid-run --
+    _register_run persists a run as 'queued' the instant it's created,
+    before its background thread ever starts, so a run killed in that brief
+    window between "created" and "actually running" never reaches 'running'
+    either. Either way there's no way to actually recover it (the in-memory
+    Run, its subscriber queues, and its background thread are all gone with
+    the old process), so it's surfaced with status forced to 'failed' plus a
+    note, not silently left looking like it's still going forever."""
     conn = _get_conn()
     with _lock:
         rows = conn.execute(
@@ -109,7 +118,7 @@ def load_all_runs() -> list[dict]:
             summary_json, log, plan_file, related_plan_run_id, created_at, finished_at,
         ) = row
         lines = log.split("\n") if log else []
-        if status == "running":
+        if status in ("running", "queued"):
             status = "failed"
             lines.append("[dashboard restarted while this run was in progress -- treating as failed]")
             finished_at = finished_at or created_at
@@ -138,4 +147,11 @@ def delete_runs_for_project(project_id: str) -> None:
     conn = _get_conn()
     with _lock:
         conn.execute("DELETE FROM runs WHERE project_id = ?", (project_id,))
+        conn.commit()
+
+
+def delete_run(run_id: str) -> None:
+    conn = _get_conn()
+    with _lock:
+        conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         conn.commit()

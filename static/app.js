@@ -5,6 +5,7 @@ const workspaceViewEl = document.getElementById("workspace-view");
 const btnBackEl = document.getElementById("btn-back");
 const workspaceProjectNameEl = document.getElementById("workspace-project-name");
 const workspacePillsEl = document.getElementById("workspace-pills");
+const btnOpenVscodeEl = document.getElementById("btn-open-vscode");
 
 const orgsGridEl = document.getElementById("orgs-grid");
 const noOrgsMsgEl = document.getElementById("no-orgs-msg");
@@ -38,6 +39,7 @@ const deploymentSelectEl = document.getElementById("deployment-select");
 const environmentSelectEl = document.getElementById("environment-select");
 const addProjectErrorEl = document.getElementById("add-project-error");
 const btnCreateProjectEl = document.getElementById("btn-create-project");
+const retentionDaysInputEl = document.getElementById("retention-days-input");
 
 const btnInitEl = document.getElementById("btn-init");
 const btnFmtEl = document.getElementById("btn-fmt");
@@ -106,12 +108,13 @@ let tooltipShowTimer = null;
 function buildTooltip(text, isError) {
   tooltipEl.className = isError ? "tip-error" : "";
   tooltipEl.replaceChildren();
-  for (const raw of text.split("\n")) {
+  const lines = text.split("\n");
+  lines.forEach((raw, idx) => {
     if (!raw.trim()) {
       const spacer = document.createElement("div");
       spacer.className = "tip-spacer";
       tooltipEl.appendChild(spacer);
-      continue;
+      return;
     }
     const isIndented = /^\s{2,}/.test(raw);
     const wrapper = document.createElement("div");
@@ -122,10 +125,26 @@ function buildTooltip(text, isError) {
       code.textContent = raw.trim();
       wrapper.appendChild(code);
     } else {
-      wrapper.textContent = raw.trim();
+      // "Label: value" lines (e.g. auth-check details) get the label and
+      // value styled apart -- as one plain sentence each ran together with
+      // no visual way to tell a field name from the value it's reporting.
+      // Skipped on the first line so the heading styling below still wins.
+      const kv = idx > 0 ? raw.trim().match(/^([^:\n]{1,90}):\s+(.+)$/) : null;
+      if (kv) {
+        wrapper.classList.add("tip-kv");
+        const key = document.createElement("span");
+        key.className = "tip-key";
+        key.textContent = kv[1];
+        const val = document.createElement("span");
+        val.className = "tip-val";
+        val.textContent = kv[2];
+        wrapper.append(key, val);
+      } else {
+        wrapper.textContent = raw.trim();
+      }
     }
     tooltipEl.appendChild(wrapper);
-  }
+  });
 }
 
 function positionTooltip(target) {
@@ -235,7 +254,15 @@ async function api(path, opts) {
 
 function fmtTime(ts) {
   if (!ts) return "";
-  return new Date(ts * 1000).toLocaleTimeString();
+  // Run history has no expiry (only the big plan.tfplan binary is GC'd --
+  // the run record/log stays in runs.db until Clear Runs/Delete Project), so
+  // a time-only stamp ("2:32 PM") was ambiguous about which day -- or even
+  // year -- a run was from. Year is only added when it isn't the current
+  // one, so today's/this-year's runs (the common case) stay compact.
+  const d = new Date(ts * 1000);
+  const opts = { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" };
+  if (d.getFullYear() !== new Date().getFullYear()) opts.year = "numeric";
+  return d.toLocaleString(undefined, opts);
 }
 
 // ---------- status rendering (tick / cross instead of a status word) ----------
@@ -507,6 +534,11 @@ function renderProjectCard(p) {
       <span class="pill" data-tip="Cloud provider&#10;Azure is the only supported provider right now.">${escapeHtml(
         p.cloud_provider || "azure"
       )}</span>
+      <span class="pill" data-tip="${escapeHtml(
+        p.retention_days
+          ? `Run retention: ${p.retention_days} day${p.retention_days === 1 ? "" : "s"}\nFinished init/plan/apply runs older than this are deleted automatically.`
+          : "Run retention: keep forever\nNo automatic cleanup -- edit the project to set a limit."
+      )}">${p.retention_days ? `${p.retention_days}d retention` : "keeps runs forever"}</span>
     </div>
     <div class="path">${p.project_root}</div>
     <div class="init-status ${p.initialized ? "ok" : "pending"}">
@@ -634,6 +666,7 @@ btnAddProjectEl.onclick = () => {
   projectNameInputEl.disabled = false;
   projectNameInputEl.title = "";
   projectRootInputEl.value = "";
+  retentionDaysInputEl.value = "";
   tabExistingFolderEl.classList.remove("hidden");
   tabNewFolderEl.classList.remove("hidden");
   document.getElementById("folder-mode-tabs").classList.remove("hidden");
@@ -649,6 +682,7 @@ async function openEditProjectModal(project) {
   projectNameInputEl.disabled = true;
   projectNameInputEl.title = "Name can't be changed -- it's the stable key this project's URL is built on. Delete and re-add it to rename.";
   projectRootInputEl.value = project.project_root;
+  retentionDaysInputEl.value = project.retention_days ?? "";
   // Editing only ever re-scans an existing folder -- "Initialize new folder" doesn't apply to a project that already exists.
   document.getElementById("folder-mode-tabs").classList.add("hidden");
   setFolderMode("existing");
@@ -756,12 +790,24 @@ btnCreateProjectEl.onclick = async () => {
   const deployment = deploymentSelectEl.value;
   const environment = environmentSelectEl.value;
   if (!deployment || !environment) { showAddProjectError("Pick a deployment and environment."); return; }
+
+  const retentionRaw = retentionDaysInputEl.value.trim();
+  let retentionDays = null;
+  if (retentionRaw !== "") {
+    const n = Number(retentionRaw);
+    if (!Number.isInteger(n) || n < 0) {
+      showAddProjectError("Run retention must be a whole number of days (blank = keep forever).");
+      return;
+    }
+    retentionDays = n;
+  }
+
   try {
     if (editingProjectId) {
       await api(`/api/projects/${editingProjectId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_root: projectRoot, deployment, environment }),
+        body: JSON.stringify({ project_root: projectRoot, deployment, environment, retention_days: retentionDays }),
       });
       closeModals();
       refreshProjects();
@@ -777,6 +823,7 @@ btnCreateProjectEl.onclick = async () => {
           project_root: projectRoot,
           deployment,
           environment,
+          retention_days: retentionDays,
         }),
       });
       closeModals();
@@ -797,7 +844,7 @@ async function openWorkspace(project, { pushHistory = true } = {}) {
   btnBackEl.classList.remove("hidden");
   btnBackEl.textContent = "← Projects";
   renderTargetPills(project);
-  logEl.textContent = "";
+  resetLogView();
   runTitleEl.textContent = "No run selected";
   runStatusEl.innerHTML = "";
   runStatusEl.className = "status";
@@ -988,6 +1035,10 @@ const planDiffContainerEl = document.getElementById("plan-diff-container");
 const planDiffTableBodyEl = document.querySelector("#plan-diff-table tbody");
 const planDiffCountsEl = document.getElementById("plan-diff-counts");
 const btnToggleRawLogEl = document.getElementById("btn-toggle-raw-log");
+const progressToolbarEl = document.getElementById("progress-toolbar");
+const progressListEl = document.getElementById("progress-list");
+const progressCountsEl = document.getElementById("progress-counts");
+const btnToggleProgressLogEl = document.getElementById("btn-toggle-progress-log");
 
 function escapeHtml(s) {
   const div = document.createElement("div");
@@ -1024,15 +1075,140 @@ function buildDetailRows(rc) {
   return rows;
 }
 
+// ---------- log rendering (plain text + "Error:"/"Warning:" diagnostic cards) ----------
+//
+// terraform's own diagnostic format is already structured:
+//   Error: <summary>
+//
+//     on main.tf line 179, in module "app_service":
+//    179:   totally_fake_argument_for_error_demo = "this will fail on purpose"
+//
+//   An argument named "..." is not expected here.
+// Parsed into cards instead of leaving the failure buried in a wall of
+// monochrome log text. Falls back to plain text for anything that doesn't
+// match this shape, so unrelated log content is never mangled.
+const DIAG_RE = /^(Error|Warning): (.+)$/;
+const DIAG_LOCATION_RE = /^\s{2}on (.+?) line (\d+)(?:, in (.+))?:$/;
+const DIAG_CODE_RE = /^\s*(\d+):\s?(.*)$/;
+
+function parseLogBlocks(lines) {
+  const blocks = [];
+  let textBuf = [];
+  const flushText = () => {
+    if (textBuf.length) blocks.push({ type: "text", lines: textBuf });
+    textBuf = [];
+  };
+
+  let i = 0;
+  while (i < lines.length) {
+    const diagMatch = DIAG_RE.exec(lines[i]);
+    if (!diagMatch) {
+      textBuf.push(lines[i]);
+      i++;
+      continue;
+    }
+    flushText();
+    const level = diagMatch[1].toLowerCase(); // "error" | "warning"
+    const summary = diagMatch[2];
+    i++;
+    if (lines[i] === "") i++;
+
+    let location = null;
+    const locMatch = i < lines.length ? DIAG_LOCATION_RE.exec(lines[i]) : null;
+    if (locMatch) {
+      location = { file: locMatch[1], line: locMatch[2], block: locMatch[3] || null };
+      i++;
+    }
+
+    const codeLines = [];
+    while (i < lines.length && DIAG_CODE_RE.test(lines[i])) {
+      codeLines.push(lines[i]);
+      i++;
+    }
+    if (lines[i] === "") i++;
+
+    const detail = [];
+    while (i < lines.length && lines[i] !== "" && !DIAG_RE.test(lines[i])) {
+      detail.push(lines[i]);
+      i++;
+    }
+    blocks.push({ type: "diagnostic", level, summary, location, codeLines, detail });
+  }
+  flushText();
+  return blocks;
+}
+
+function renderDiagCodeLine(line) {
+  const m = DIAG_CODE_RE.exec(line);
+  if (!m) return `<span class="diag-code-line">${escapeHtml(line)}</span>`;
+  return `<span class="diag-code-line"><span class="diag-code-lineno">${escapeHtml(m[1])}</span><span class="diag-code-src">${escapeHtml(m[2])}</span></span>`;
+}
+
+function renderLogBlockHtml(block) {
+  if (block.type === "text") {
+    return `<span class="log-text">${escapeHtml(block.lines.join("\n"))}</span>`;
+  }
+  const locationHtml = block.location
+    ? `<div class="diag-location">on <span class="diag-file">${escapeHtml(block.location.file)}</span> line ${escapeHtml(
+        block.location.line
+      )}${block.location.block ? `, in ${escapeHtml(block.location.block)}` : ""}</div>`
+    : "";
+  const codeHtml = block.codeLines.length
+    ? `<div class="diag-code">${block.codeLines.map(renderDiagCodeLine).join("")}</div>`
+    : "";
+  const detailHtml = block.detail.length ? `<div class="diag-detail">${escapeHtml(block.detail.join("\n"))}</div>` : "";
+  return `<div class="diag-block ${block.level}">
+    <div class="diag-head"><span class="diag-icon">${block.level === "error" ? "&#10007;" : "&#33;"}</span><span class="diag-title">${escapeHtml(
+    block.summary
+  )}</span></div>
+    ${locationHtml}${codeHtml}${detailHtml}
+  </div>`;
+}
+
+let logLines = [];
+
+function renderLogView() {
+  logEl.innerHTML = parseLogBlocks(logLines).map(renderLogBlockHtml).join("");
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+function resetLogView() {
+  logLines = [];
+  logEl.innerHTML = "";
+}
+
+function setLogLines(lines) {
+  logLines = lines.slice();
+  renderLogView();
+}
+
+function appendLogLine(line) {
+  logLines.push(line);
+  renderLogView();
+}
+
+// Exactly one of raw log / plan-diff table / live progress checklist is ever
+// shown at a time in the detail panel -- funnel that switch through here.
+// Deliberately doesn't touch either toolbar's visibility: each toolbar (and
+// the "Show raw log"/"Show table"/"Show progress" button living inside it)
+// must stay visible across a log<->diff or log<->progress toggle, or
+// toggling to raw log would hide the very button needed to toggle back.
+// Toolbars are shown once by showPlanDiff/showProgressView when that view
+// has something to show, and reset to hidden only when a new run is
+// selected (see selectRun).
+function setDetailView(mode) {
+  logEl.classList.toggle("hidden", mode !== "log");
+  planDiffContainerEl.classList.toggle("hidden", mode !== "diff");
+  progressListEl.classList.toggle("hidden", mode !== "progress");
+}
+
 async function showPlanDiff(run) {
-  planViewToolbarEl.classList.add("hidden");
-  planDiffContainerEl.classList.add("hidden");
-  logEl.classList.remove("hidden");
-  if (run.kind !== "plan" || run.status !== "success") return;
+  setDetailView("log");
+  if (run.kind !== "plan" || run.status !== "success") return false;
 
   try {
     const diff = await api(`/api/runs/${run.run_id}/plan-diff`);
-    if (diff.total === 0) return; // "No changes" -- raw log already says so, nothing to tabulate
+    if (diff.total === 0) return false; // "No changes" -- raw log already says so, nothing to tabulate
 
     document.getElementById("btn-download-json").href = `/api/runs/${run.run_id}/plan-diff/export?format=json`;
     document.getElementById("btn-download-csv").href = `/api/runs/${run.run_id}/plan-diff/export?format=csv`;
@@ -1075,20 +1251,127 @@ async function showPlanDiff(run) {
       planDiffTableBodyEl.appendChild(detailTr);
     }
 
+    setDetailView("diff");
     planViewToolbarEl.classList.remove("hidden");
-    planDiffContainerEl.classList.remove("hidden");
-    logEl.classList.add("hidden");
     btnToggleRawLogEl.textContent = "Show raw log";
+    return true;
   } catch (e) {
     // no .tfplan file (expired/restarted) or parse failure -- just keep showing the raw log
+    return false;
   }
 }
 
 btnToggleRawLogEl.onclick = () => {
   const tableCurrentlyShown = !planDiffContainerEl.classList.contains("hidden");
-  planDiffContainerEl.classList.toggle("hidden", tableCurrentlyShown);
-  logEl.classList.toggle("hidden", !tableCurrentlyShown);
+  setDetailView(tableCurrentlyShown ? "log" : "diff");
   btnToggleRawLogEl.textContent = tableCurrentlyShown ? "Show table" : "Show raw log";
+};
+
+// ---------- live progress checklist (plan/apply) ----------
+//
+// terraform's own plain-text output already narrates per-resource progress
+// ("aws_instance.foo: Creating...", "... Still creating... [10s elapsed]",
+// "... Creation complete after 1m8s [id=...]") -- parsed client-side into a
+// checklist instead of leaving the user to track dozens of interleaved
+// "Still X... [Ns elapsed]" lines by eye while an apply runs.
+// "Refreshing state..." (unlike "Creating...") always has "[id=...]" tacked
+// onto the same line -- without the optional trailing group below, that
+// suffix broke the `$` anchor and every refresh line (i.e. the entire
+// running phase of a plan, before anything is created/changed) silently
+// failed to parse, so the checklist never appeared until much later.
+const RESOURCE_START_RE = /^(.+?): (Creating|Destroying|Modifying|Reading|Refreshing state)\.\.\.\s*(?:\[id=(.+)\])?$/;
+// "Still modifying/destroying..." packs the resource's real id AND the
+// elapsed time into the same bracket ("[id=/subscriptions/..., 00m10s
+// elapsed]") -- unlike "Still creating..." which is just "[10s elapsed]".
+// Without stripping the optional "id=..., " prefix, the whole (often very
+// long) Azure resource id ended up rendered as the "elapsed" detail text.
+const RESOURCE_STILL_RE = /^(.+?): Still (creating|destroying|modifying|reading|refreshing state)\.\.\. \[(?:id=.+?, )?(.+?) elapsed\]$/;
+const RESOURCE_DONE_RE = /^(.+?): (.+?) complete after ([^[]+?)\s*(?:\[id=(.+)])?$/;
+
+function progressActionKind(verb) {
+  const v = verb.toLowerCase();
+  if (v.startsWith("creat")) return "create";
+  if (v.startsWith("destr")) return "destroy";
+  if (v.startsWith("modif")) return "update";
+  if (v.startsWith("read")) return "read";
+  if (v.startsWith("refresh")) return "refresh";
+  return "other";
+}
+
+function parseProgressLine(line) {
+  let m = RESOURCE_DONE_RE.exec(line);
+  if (m) return { address: m[1], kind: progressActionKind(m[2]), phase: "done", detail: m[3].trim() };
+  m = RESOURCE_STILL_RE.exec(line);
+  if (m) return { address: m[1], kind: progressActionKind(m[2]), phase: "progress", detail: m[3].trim() };
+  m = RESOURCE_START_RE.exec(line);
+  if (m) return { address: m[1], kind: progressActionKind(m[2]), phase: "start" };
+  return null;
+}
+
+let currentProgress = new Map(); // address -> {address, kind, phase, detail} -- insertion order == first-seen order
+
+function resetProgress() {
+  currentProgress = new Map();
+  progressListEl.innerHTML = "";
+}
+
+// Returns true if this line was a resource-progress line (caller uses that
+// to know whether a re-render/auto-reveal is worth doing).
+function ingestProgressLine(line) {
+  const parsed = parseProgressLine(line);
+  if (!parsed) return false;
+  const entry = currentProgress.get(parsed.address) || { address: parsed.address };
+  entry.kind = parsed.kind;
+  if (parsed.phase === "done") {
+    entry.phase = "done";
+    entry.detail = parsed.detail;
+  } else if (entry.phase !== "done") {
+    entry.phase = "progress";
+    if (parsed.phase === "progress") entry.detail = parsed.detail;
+  }
+  currentProgress.set(parsed.address, entry);
+  return true;
+}
+
+function ingestProgressLines(lines) {
+  let any = false;
+  for (const line of lines) any = ingestProgressLine(line) || any;
+  return any;
+}
+
+const PROGRESS_KIND_LABEL = { create: "create", update: "update", destroy: "destroy", read: "read", refresh: "refresh", other: "other" };
+
+function progressRowHtml(e) {
+  const done = e.phase === "done";
+  const detailText = done ? `done in ${e.detail || "?"}` : e.detail ? `${e.detail} elapsed` : "starting…";
+  return `<li class="progress-row ${done ? "done" : "running"} kind-${e.kind}">
+    <span class="progress-icon">${done ? "&#10003;" : ""}</span>
+    <span class="progress-address">${escapeHtml(e.address)}</span>
+    <span class="action-badge ${e.kind}">${PROGRESS_KIND_LABEL[e.kind] || e.kind}</span>
+    <span class="progress-detail muted">${escapeHtml(detailText)}</span>
+  </li>`;
+}
+
+function renderProgressList() {
+  const entries = [...currentProgress.values()];
+  progressListEl.innerHTML = entries.map(progressRowHtml).join("");
+  const done = entries.filter((e) => e.phase === "done").length;
+  progressCountsEl.textContent = entries.length
+    ? `${done} / ${entries.length} resource action${entries.length === 1 ? "" : "s"} finished`
+    : "";
+}
+
+function showProgressView() {
+  renderProgressList();
+  setDetailView("progress");
+  progressToolbarEl.classList.remove("hidden");
+  btnToggleProgressLogEl.textContent = "Show raw log";
+}
+
+btnToggleProgressLogEl.onclick = () => {
+  const progressCurrentlyShown = !progressListEl.classList.contains("hidden");
+  setDetailView(progressCurrentlyShown ? "log" : "progress");
+  btnToggleProgressLogEl.textContent = progressCurrentlyShown ? "Show progress" : "Show raw log";
 };
 
 // ---------- compare plans ----------
@@ -1168,10 +1451,11 @@ async function runCompare(otherRunId) {
 async function selectRun(runId) {
   currentRunId = runId;
   resetActionBar();
-  logEl.textContent = "";
-  logEl.classList.remove("hidden");
+  resetLogView();
+  resetProgress();
+  setDetailView("log");
   planViewToolbarEl.classList.add("hidden");
-  planDiffContainerEl.classList.add("hidden");
+  progressToolbarEl.classList.add("hidden");
   if (currentEventSource) {
     currentEventSource.close();
     currentEventSource = null;
@@ -1182,25 +1466,41 @@ async function selectRun(runId) {
     ? `${detail.kind.toUpperCase()} "${detail.name}"`
     : `${detail.kind.toUpperCase()} — ${runId.slice(0, 8)}`;
   setRunStatus(detail.status);
-  logEl.textContent = detail.lines.join("\n");
-  logEl.scrollTop = logEl.scrollHeight;
-
   refreshRunsList();
 
+  const showsProgress = detail.kind === "plan" || detail.kind === "apply";
+
   if (detail.status === "success" || detail.status === "failed") {
+    setLogLines(detail.lines);
+    const hadProgress = showsProgress && ingestProgressLines(detail.lines);
+
     if (detail.kind === "plan") {
       showPlanSummary(detail);
-      await showPlanDiff(detail);
+      const diffShown = await showPlanDiff(detail);
+      if (!diffShown && hadProgress) showProgressView();
+    } else if (detail.kind === "apply" && hadProgress) {
+      showProgressView();
     }
     if (detail.kind === "init") await refreshCurrentProjectInitState();
     return;
   }
 
+  // Log content comes entirely from the stream below, not from `detail.lines`
+  // here -- the server's subscribe() replays this run's full history into
+  // the SSE stream before any live tail, so pre-filling it from this GET too
+  // would show every line so far twice.
   const es = new EventSource(`/api/runs/${runId}/stream`);
   currentEventSource = es;
+  let autoShownProgress = false;
   es.onmessage = (ev) => {
-    logEl.textContent += (logEl.textContent ? "\n" : "") + ev.data;
-    logEl.scrollTop = logEl.scrollHeight;
+    appendLogLine(ev.data);
+    if (!showsProgress || !ingestProgressLine(ev.data)) return;
+    if (!autoShownProgress) {
+      autoShownProgress = true;
+      showProgressView();
+    } else if (!progressListEl.classList.contains("hidden")) {
+      renderProgressList();
+    }
   };
   es.addEventListener("done", async () => {
     es.close();
@@ -1209,7 +1509,10 @@ async function selectRun(runId) {
     refreshRunsList();
     if (finalDetail.kind === "plan") {
       showPlanSummary(finalDetail);
-      await showPlanDiff(finalDetail);
+      const diffShown = await showPlanDiff(finalDetail);
+      if (!diffShown && currentProgress.size > 0) showProgressView();
+    } else if (finalDetail.kind === "apply" && currentProgress.size > 0) {
+      showProgressView();
     }
     if (finalDetail.kind === "init") await refreshCurrentProjectInitState();
   });
@@ -1288,5 +1591,190 @@ async function runPlan(destroy) {
 }
 btnPlanEl.onclick = () => runPlan(false);
 btnPlanDestroyEl.onclick = () => runPlan(true);
+
+// ---------- tfvars pretty-config viewer ----------
+
+const btnViewTfvarsEl = document.getElementById("btn-view-tfvars");
+const tfvarsModalEl = document.getElementById("tfvars-modal");
+const tfvarsPathEl = document.getElementById("tfvars-path");
+const tfvarsToolbarEl = document.getElementById("tfvars-toolbar");
+const btnToggleTfvarsRawEl = document.getElementById("btn-toggle-tfvars-raw");
+const tfvarsErrorEl = document.getElementById("tfvars-error");
+const tfvarsTreeEl = document.getElementById("tfvars-tree");
+const tfvarsRawEl = document.getElementById("tfvars-raw");
+
+function tfvarsPrimitiveHtml(value) {
+  if (value === null) return `<span class="tfv-null">null</span>`;
+  if (typeof value === "object" && "__ref__" in value) return `<span class="tfv-ref">${escapeHtml(value.__ref__)}</span>`;
+  if (typeof value === "string") return `<span class="tfv-string">"${escapeHtml(value)}"</span>`;
+  if (typeof value === "number") return `<span class="tfv-number">${value}</span>`;
+  if (typeof value === "boolean") return `<span class="tfv-bool">${value}</span>`;
+  return escapeHtml(String(value));
+}
+
+// Renders one key: value pair -- a plain row for a leaf (string/number/
+// bool/null), or a collapsible <details> node for a non-empty list/map (an
+// empty one still renders as a single leaf-like row, e.g. "tags = {}", since
+// there's nothing to expand into).
+function renderTfvarsEntry(key, value) {
+  const isRef = value !== null && typeof value === "object" && "__ref__" in value;
+
+  if (!isRef && Array.isArray(value)) {
+    if (!value.length) return `<div class="tfv-row"><span class="tfv-key">${escapeHtml(key)}</span><span class="tfv-eq">=</span><span class="tfv-type">list · empty</span></div>`;
+    const children = value.map((item, i) => renderTfvarsEntry(`[${i}]`, item)).join("");
+    return `<details class="tfv-node"><summary><span class="tfv-key">${escapeHtml(key)}</span><span class="tfv-type">list · ${value.length}</span></summary><div class="tfv-children">${children}</div></details>`;
+  }
+
+  if (!isRef && value !== null && typeof value === "object") {
+    const keys = Object.keys(value);
+    if (!keys.length) return `<div class="tfv-row"><span class="tfv-key">${escapeHtml(key)}</span><span class="tfv-eq">=</span><span class="tfv-type">map · empty</span></div>`;
+    const children = keys.map((k) => renderTfvarsEntry(k, value[k])).join("");
+    return `<details class="tfv-node"><summary><span class="tfv-key">${escapeHtml(key)}</span><span class="tfv-type">map · ${keys.length} key${keys.length === 1 ? "" : "s"}</span></summary><div class="tfv-children">${children}</div></details>`;
+  }
+
+  return `<div class="tfv-row"><span class="tfv-key">${escapeHtml(key)}</span><span class="tfv-eq">=</span>${tfvarsPrimitiveHtml(value)}</div>`;
+}
+
+function setTfvarsView(mode) {
+  tfvarsTreeEl.classList.toggle("hidden", mode !== "tree");
+  tfvarsRawEl.classList.toggle("hidden", mode !== "raw");
+  btnToggleTfvarsRawEl.textContent = mode === "raw" ? "Show tree" : "Show raw file";
+}
+
+let tfvarsPollTimer = null;
+let tfvarsLastRaw = null; // last-seen raw file content -- lets a silent poll skip re-rendering (and losing expanded-node/scroll state) when nothing actually changed
+let tfvarsMode = "tree";
+
+// `silent: true` is a background poll tick -- must never clobber the modal
+// with an error toast/state over a transient failure (e.g. the file
+// briefly locked while a text editor is saving it); a manual open (silent:
+// false) does show the error, since that's a real "click and see" moment.
+async function loadTfvars({ silent = false } = {}) {
+  try {
+    const result = await api(`/api/projects/${currentProject.id}/tfvars`);
+    if (silent && result.raw === tfvarsLastRaw) return; // unchanged -- don't disturb anything
+    const changed = tfvarsLastRaw !== null && result.raw !== tfvarsLastRaw;
+    tfvarsLastRaw = result.raw;
+
+    tfvarsPathEl.textContent = result.relative_path;
+    tfvarsRawEl.textContent = result.raw;
+    tfvarsErrorEl.classList.add("hidden");
+
+    if (result.parsed) {
+      const keys = Object.keys(result.parsed);
+      tfvarsTreeEl.innerHTML = keys.length
+        ? keys.map((k) => renderTfvarsEntry(k, result.parsed[k])).join("")
+        : `<p class="muted">This file has no variable assignments.</p>`;
+      tfvarsToolbarEl.classList.remove("hidden");
+      setTfvarsView(tfvarsMode);
+    } else {
+      tfvarsErrorEl.textContent = `Could not parse this file as simple key/value tfvars (${result.parse_error}) -- showing the raw file instead.`;
+      tfvarsErrorEl.classList.remove("hidden");
+      tfvarsMode = "raw";
+      setTfvarsView("raw");
+    }
+    if (changed) toast("tfvars file changed on disk -- config view refreshed.", { type: "info", duration: 3000 });
+  } catch (e) {
+    if (!silent) {
+      tfvarsErrorEl.textContent = e.message;
+      tfvarsErrorEl.classList.remove("hidden");
+      setTfvarsView("raw");
+    }
+  }
+}
+
+btnViewTfvarsEl.onclick = async () => {
+  tfvarsErrorEl.classList.add("hidden");
+  tfvarsToolbarEl.classList.add("hidden");
+  tfvarsTreeEl.innerHTML = "";
+  tfvarsRawEl.textContent = "";
+  tfvarsPathEl.textContent = "";
+  tfvarsLastRaw = null;
+  tfvarsMode = "tree";
+  openModal(tfvarsModalEl);
+  await loadTfvars();
+
+  // Poll while the modal stays open so edits made outside the dashboard
+  // (in an editor, or by Format) show up here without needing to close and
+  // reopen it. Self-terminates by checking modalOverlayEl (not
+  // tfvarsModalEl) each tick -- closeModals() only ever hides the shared
+  // overlay, never the individual .modal div itself (only the NEXT
+  // openModal() call re-hides every .modal before showing its target), so
+  // checking tfvarsModalEl's own "hidden" class would never see it as
+  // closed until some other modal happened to be opened later, leaving
+  // this polling forever in the meantime.
+  if (tfvarsPollTimer) clearInterval(tfvarsPollTimer);
+  tfvarsPollTimer = setInterval(() => {
+    if (modalOverlayEl.classList.contains("hidden")) {
+      clearInterval(tfvarsPollTimer);
+      tfvarsPollTimer = null;
+      return;
+    }
+    loadTfvars({ silent: true });
+  }, 2000);
+};
+
+btnToggleTfvarsRawEl.onclick = () => {
+  tfvarsMode = tfvarsRawEl.classList.contains("hidden") ? "raw" : "tree";
+  setTfvarsView(tfvarsMode);
+};
+
+// ---------- restart server ----------
+
+const btnRestartServerEl = document.getElementById("btn-restart-server");
+
+btnRestartServerEl.onclick = async () => {
+  let activeCount = 0;
+  try {
+    ({ count: activeCount } = await api("/api/server/active-runs"));
+  } catch (e) {
+    // if this check itself fails the server is already in trouble -- fall through to the confirm dialog anyway
+  }
+
+  const ok = await confirmDialog(
+    (activeCount > 0
+      ? `This will interrupt ${activeCount} run${activeCount === 1 ? "" : "s"} currently in progress (for any project, not just this one). `
+      : "") +
+      "The whole dashboard process will restart (stop.ps1 then start.ps1) -- it'll be unreachable for a few seconds, then this page will reload itself.",
+    { title: "Restart the dashboard server?", okLabel: "Restart", danger: true }
+  );
+  if (!ok) return;
+
+  try {
+    await api("/api/server/restart", { method: "POST" });
+  } catch (e) {
+    toast(`Could not start restart: ${e.message}`, { type: "error" });
+    return;
+  }
+  toast("Restarting -- this page will reload automatically once the server is back.", { type: "info", duration: 8000 });
+
+  // Poll for the server coming back up, then reload for a clean state
+  // (rather than trying to re-sync every in-memory view/modal by hand).
+  const pollUntilBack = async () => {
+    for (let i = 0; i < 30; i++) {
+      await new Promise((res) => setTimeout(res, 1000));
+      try {
+        const res = await fetch("/api/organizations", { cache: "no-store" });
+        if (res.ok) {
+          location.reload();
+          return;
+        }
+      } catch (e) {
+        // still down -- keep polling
+      }
+    }
+  };
+  pollUntilBack();
+};
+
+// ---------- open in VS Code ----------
+
+btnOpenVscodeEl.onclick = async () => {
+  try {
+    await api(`/api/projects/${currentProject.id}/open-vscode`, { method: "POST" });
+  } catch (e) {
+    toast(`Could not open VS Code: ${e.message}`, { type: "error", duration: 7000 });
+  }
+};
 
 restoreFromLocation({ pushHistory: false });

@@ -36,8 +36,15 @@ import run_manager as rm
 from mcp.server.mcpserver import MCPServer
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-HOST = "127.0.0.1"
-PORT = 8765
+# 127.0.0.1 by default -- this can trigger real changes against real Azure
+# subscriptions, it should never be reachable off this machine (see the
+# module docstring). The Docker image overrides HOST to 0.0.0.0 (binding to
+# loopback INSIDE a container makes it unreachable from the host entirely,
+# a common container gotcha) -- docker-compose.yml then re-establishes the
+# same "never reachable off this machine" guarantee by publishing the port
+# as 127.0.0.1:8765:8765, not a bare 8765:8765.
+HOST = os.environ.get("IAC_DASHBOARD_HOST", "127.0.0.1")
+PORT = int(os.environ.get("IAC_DASHBOARD_PORT", "8765"))
 
 
 async def _json_body(request: Request) -> tuple[dict | None, JSONResponse | None]:
@@ -158,29 +165,49 @@ async def initialize_project_folder(project_root: str) -> dict:
 
 
 @server.tool()
-async def add_project(org_id: str, name: str, project_root: str, deployment: str, environment: str) -> dict:
+async def add_project(
+    org_id: str,
+    name: str,
+    project_root: str,
+    deployment: str,
+    environment: str,
+    retention_days: int | None = None,
+) -> dict:
     """Save a new named Work Project, under an existing Organization
     (org_id), pointing at one deployment+environment discovered via
     discover_project or initialize_project_folder. Azure is the only
-    supported cloud provider right now. Does not run init yet -- call
+    supported cloud provider right now. retention_days auto-deletes
+    finished init/plan/apply run history older than that many days
+    (checked after every run and at server startup); omit it (or pass 0) to
+    keep run history forever, the default. Does not run init yet -- call
     init_project with the returned id next."""
     try:
-        return await asyncio.to_thread(rm.add_project, org_id, name, project_root, deployment, environment)
+        return await asyncio.to_thread(
+            rm.add_project, org_id, name, project_root, deployment, environment, "azure", retention_days
+        )
     except ValueError as e:
         return {"error": str(e)}
 
 
 @server.tool()
-async def update_project(project_root: str, deployment: str, environment: str, project_id: str) -> dict:
+async def update_project(
+    project_root: str,
+    deployment: str,
+    environment: str,
+    project_id: str,
+    retention_days: int | None = None,
+) -> dict:
     """Change a saved project's folder/deployment/environment in place (same
     id, same name, same run history). Name is not editable -- it's the
     stable key the dashboard's /project/<name> URLs are built on; delete and
     re-add the project if you genuinely need to rename it. If the folder/
     deployment/environment actually changed, the project is marked
     not-initialized again -- call init_project before terraform_plan after
-    an update like that."""
+    an update like that. retention_days is left unchanged if omitted; pass
+    it explicitly (0 to mean "keep forever") to change it."""
     try:
-        return await asyncio.to_thread(rm.update_project, project_id, project_root, deployment, environment)
+        kwargs = {} if retention_days is None else {"retention_days": retention_days}
+        return await asyncio.to_thread(rm.update_project, project_id, project_root, deployment, environment, **kwargs)
     except ValueError as e:
         return {"error": str(e)}
 
@@ -216,6 +243,21 @@ async def check_auth(project_id: str) -> dict:
     run that was going to be refused anyway."""
     try:
         return await asyncio.to_thread(rm.check_auth, project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def get_tfvars(project_id: str) -> dict:
+    """Read this project's tfvars file and return it parsed into a real
+    nested dict/list/str/number/bool structure (`parsed`) instead of raw
+    text -- so you can summarize or answer questions about its config
+    directly. Also always returns the raw file text (`raw`) and, if parsing
+    failed on something this simple HCL-lite parser doesn't handle (e.g. a
+    heredoc or an interpolated expression), `parse_error` explaining why,
+    with `parsed` set to null in that case -- fall back to `raw` then."""
+    try:
+        return await asyncio.to_thread(rm.get_tfvars, project_id)
     except ValueError as e:
         return {"error": str(e)}
 
@@ -422,6 +464,26 @@ async def style_css(request: Request):
 # ===================================================================================
 
 
+@server.custom_route("/api/server/active-runs", methods=["GET"])
+async def api_active_runs(request: Request):
+    """How many projects have an init/fmt/validate/plan/apply in flight right
+    now -- the dashboard checks this before letting you confirm a restart,
+    so the warning can say how many runs it's about to interrupt."""
+    return JSONResponse({"count": rm.count_active_runs()})
+
+
+@server.custom_route("/api/server/restart", methods=["POST"])
+async def api_restart_server(request: Request):
+    """Restart the whole dashboard process. No confirmation token here (unlike
+    apply) -- the dashboard UI itself gates this behind a confirm dialog,
+    since it's a purely local, human-only action; deliberately not exposed
+    as an MCP tool."""
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.restart_server))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @server.custom_route("/api/browse-folder", methods=["POST"])
 async def api_browse_folder(request: Request):
     """Pops a native Windows folder picker on this machine and returns the
@@ -431,6 +493,17 @@ async def api_browse_folder(request: Request):
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=500)
     return JSONResponse({"path": path})
+
+
+@server.custom_route("/api/projects/{project_id}/open-vscode", methods=["POST"])
+async def api_open_vscode(request: Request):
+    """Launches VS Code on this same machine, pointed at the project's
+    deployment folder. Dashboard-only (not an MCP tool) -- opens a GUI
+    window on the user's own desktop."""
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.open_in_vscode, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @server.custom_route("/api/project/discover", methods=["POST"])
@@ -501,7 +574,12 @@ async def api_add_project(request: Request):
         return JSONResponse({"error": f"missing required field(s): {missing}"}, status_code=400)
     try:
         project = rm.add_project(
-            body["org_id"], body["name"], body["project_root"], body["deployment"], body["environment"]
+            body["org_id"],
+            body["name"],
+            body["project_root"],
+            body["deployment"],
+            body["environment"],
+            retention_days=body.get("retention_days"),
         )
         return JSONResponse(project)
     except ValueError as e:
@@ -532,7 +610,11 @@ async def api_update_project(request: Request):
         return JSONResponse({"error": f"missing required field(s): {missing}"}, status_code=400)
     try:
         project = rm.update_project(
-            request.path_params["project_id"], body["project_root"], body["deployment"], body["environment"]
+            request.path_params["project_id"],
+            body["project_root"],
+            body["deployment"],
+            body["environment"],
+            retention_days=body.get("retention_days"),
         )
         return JSONResponse(project)
     except ValueError as e:
@@ -554,6 +636,14 @@ async def api_auth_check(request: Request):
         return JSONResponse(await asyncio.to_thread(rm.check_auth, request.path_params["project_id"]))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=404)
+
+
+@server.custom_route("/api/projects/{project_id}/tfvars", methods=["GET"])
+async def api_tfvars(request: Request):
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.get_tfvars, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @server.custom_route("/api/projects/{project_id}/init", methods=["POST"])

@@ -25,6 +25,7 @@ import queue
 import secrets
 import shutil
 import subprocess
+import tempfile
 
 import run_store
 import threading
@@ -39,15 +40,21 @@ PLAN_FILE_TTL_SECONDS = 30 * 60
 # default (still fully viewable/streamable right after you click them).
 PERSISTED_KINDS = {"init", "plan", "apply"}
 
-PROJECTS_FILE = os.path.join(os.path.dirname(__file__), "projects.json")
-ORGS_FILE = os.path.join(os.path.dirname(__file__), "organizations.json")
+# All persisted state lives under DATA_DIR -- defaults to right next to this
+# script (unchanged native behavior), but is overridable so it can point at
+# a mounted volume instead (the Docker image sets IAC_DASHBOARD_DATA_DIR=
+# /data) -- otherwise every container rebuild would start from zero with no
+# saved organizations/projects/run history.
+DATA_DIR = os.environ.get("IAC_DASHBOARD_DATA_DIR", os.path.dirname(__file__))
+PROJECTS_FILE = os.path.join(DATA_DIR, "projects.json")
+ORGS_FILE = os.path.join(DATA_DIR, "organizations.json")
 
 # Everything a run produces (plan.tfplan, diff.json) lives here, scoped by
 # project then run -- NOT inside the actual Terraform repo. Early versions
 # put a .dashboard-plans/ folder inside the deployment directory itself,
 # which polluted the user's real IaC repo with dashboard bookkeeping; this
 # keeps all of that self-contained to the dashboard's own folder instead.
-PROJECT_DATA_DIR = os.path.join(os.path.dirname(__file__), "project-data")
+PROJECT_DATA_DIR = os.path.join(DATA_DIR, "project-data")
 
 
 def _run_data_dir(project_id: str, run_id: str) -> str:
@@ -77,10 +84,22 @@ def _save_orgs(orgs: list[dict]):
         json.dump(orgs, f, indent=2)
 
 
-def add_org(name: str) -> dict:
+def _validate_name(name: str, what: str) -> str:
+    """Shared name validation for Organizations and Work Projects: both are
+    stable, permanent keys the dashboard's own URLs are built on directly
+    (/<org-name>/<project-name>, see server.py's SPA catch-all routes) --
+    rejecting spaces (and other whitespace) up front means that URL never
+    needs percent-encoding and never looks broken/copy-paste-unfriendly."""
     name = name.strip()
     if not name:
-        raise ValueError("name cannot be empty")
+        raise ValueError(f"{what} name cannot be empty")
+    if any(c.isspace() for c in name):
+        raise ValueError(f"{what} name can't contain spaces -- use '-' or '_' instead (e.g. 'my-{what}')")
+    return name
+
+
+def add_org(name: str) -> dict:
+    name = _validate_name(name, "organization")
 
     org = {"id": str(uuid.uuid4()), "name": name, "created_at": time.time()}
     with _orgs_lock:
@@ -301,8 +320,31 @@ def initialize_project_folder(project_root: str) -> dict:
     return discover_project(project_root)
 
 
+def _validate_retention_days(value) -> int | None:
+    """None/""/0 all mean "keep run history forever" (the historical
+    behavior, and the default for any project that predates this setting --
+    old projects.json records simply lack the key, and .get() reads that the
+    same as an explicit None). Otherwise must be a positive whole number of
+    days."""
+    if value in (None, ""):
+        return None
+    try:
+        days = int(value)
+    except (TypeError, ValueError):
+        raise ValueError("retention_days must be a whole number of days (or empty/0 for 'keep forever')")
+    if days < 0:
+        raise ValueError("retention_days can't be negative")
+    return days or None
+
+
 def add_project(
-    org_id: str, name: str, project_root: str, deployment: str, environment: str, cloud_provider: str = "azure"
+    org_id: str,
+    name: str,
+    project_root: str,
+    deployment: str,
+    environment: str,
+    cloud_provider: str = "azure",
+    retention_days: int | None = None,
 ) -> dict:
     # Kept as a stored field so an AWS (or other) provider can be added later
     # without migrating existing records -- but only azure is accepted today.
@@ -311,9 +353,8 @@ def add_project(
     if get_org(org_id) is None:
         raise ValueError("unknown org_id -- create an organization first")
 
-    name = name.strip()
-    if not name:
-        raise ValueError("name cannot be empty")
+    name = _validate_name(name, "project")
+    retention_days = _validate_retention_days(retention_days)
 
     discovered = discover_project(project_root)
     dep_names = [d["name"] for d in discovered["deployments"]]
@@ -335,6 +376,7 @@ def add_project(
         "deployment": deployment,
         "environment": environment,
         "cloud_provider": cloud_provider,
+        "retention_days": retention_days,
         "created_at": time.time(),
     }
 
@@ -402,7 +444,12 @@ def remove_project(project_id: str):
         shutil.rmtree(project_dir, ignore_errors=True)
 
 
-def update_project(project_id: str, project_root: str, deployment: str, environment: str) -> dict:
+_UNSET = object()  # distinguishes "caller didn't mention retention_days" (keep existing) from an explicit None (clear it)
+
+
+def update_project(
+    project_id: str, project_root: str, deployment: str, environment: str, retention_days=_UNSET
+) -> dict:
     """Change a saved project's folder/deployment/environment in place (same
     id, same name, same run history). Name is deliberately NOT editable --
     it's the stable key the dashboard's /project/<name> URLs are built on,
@@ -411,7 +458,12 @@ def update_project(project_id: str, project_root: str, deployment: str, environm
     Re-validates the new folder/deployment/env the same way add_project
     does. Marks the project as not-yet-initialized again if the folder,
     deployment, or environment actually changed, since the old init no
-    longer necessarily applies."""
+    longer necessarily applies.
+
+    retention_days left unspecified keeps whatever the project already had
+    (so existing callers -- the MCP tool, older saved automations -- don't
+    need to know about this field to keep editing the rest); pass it
+    explicitly (including None, for "keep forever") to change it."""
     existing = get_project(project_id)
     if existing is None:
         raise ValueError("unknown project_id")
@@ -428,6 +480,8 @@ def update_project(project_id: str, project_root: str, deployment: str, environm
             f"(available: {dep_info['environments']})"
         )
 
+    new_retention = existing.get("retention_days") if retention_days is _UNSET else _validate_retention_days(retention_days)
+
     # No need to reset any "initialized" flag when the folder/deployment
     # changes -- _is_initialized() reads .terraform/ from whatever directory
     # the project now points at, so it's correct automatically.
@@ -436,6 +490,7 @@ def update_project(project_id: str, project_root: str, deployment: str, environm
         "project_root": discovered["project_root"],
         "deployment": deployment,
         "environment": environment,
+        "retention_days": new_retention,
     }
 
     with _projects_lock:
@@ -468,6 +523,176 @@ def _source_mtimes(target: dict) -> dict:
         except OSError:
             result[key] = None
     return result
+
+
+# ===================================================================================
+# TFVARS PARSING -- turns a .tfvars file into real nested dict/list/str/
+# number/bool/None values instead of raw text, so the dashboard can show it
+# as a pretty key/value tree. Deliberately a small hand-rolled HCL-lite
+# parser rather than a real HCL library: tfvars only ever contain literal
+# assignments (strings/numbers/bools/null/lists/maps, arbitrarily nested) --
+# never expressions, functions, or resource references -- so that's all this
+# needs to handle. Falls back to the raw file text (get_tfvars always
+# returns that too) on anything it can't parse, same "never block on it,
+# just don't show the pretty version" philosophy as get_plan_diff.
+# ===================================================================================
+
+
+class TfvarsParseError(ValueError):
+    pass
+
+
+_TFVARS_TOKEN_SPEC = [
+    ("COMMENT", r"(?:\#|//)[^\n]*|/\*.*?\*/"),
+    ("STRING", r'"(?:\\.|[^"\\])*"'),
+    ("NUMBER", r"-?\d+(?:\.\d+)?"),
+    ("NEWLINE", r"\n"),
+    ("WS", r"[ \t\r]+"),
+    ("IDENT", r"[A-Za-z_][A-Za-z0-9_-]*"),
+    ("EQUALS", r"="),
+    ("LBRACE", r"\{"),
+    ("RBRACE", r"\}"),
+    ("LBRACKET", r"\["),
+    ("RBRACKET", r"\]"),
+    ("COMMA", r","),
+    ("MISMATCH", r"."),
+]
+_TFVARS_TOKEN_RE = re.compile(
+    "|".join(f"(?P<{name}>{pattern})" for name, pattern in _TFVARS_TOKEN_SPEC), re.DOTALL
+)
+_SKIP_TOKEN_KINDS = {"COMMENT", "NEWLINE", "WS"}
+
+
+def _tokenize_tfvars(text: str) -> list[tuple[str, str]]:
+    tokens = []
+    for m in _TFVARS_TOKEN_RE.finditer(text):
+        kind = m.lastgroup
+        if kind in _SKIP_TOKEN_KINDS:
+            continue
+        if kind == "MISMATCH":
+            raise TfvarsParseError(f"unexpected character {m.group()!r} near position {m.start()}")
+        tokens.append((kind, m.group()))
+    return tokens
+
+
+def _unquote_tfvars_string(raw: str) -> str:
+    inner = raw[1:-1]
+    return inner.replace('\\"', '"').replace("\\n", "\n").replace("\\t", "\t").replace("\\\\", "\\")
+
+
+class _TfvarsParser:
+    """Recursive-descent parser over the token stream from _tokenize_tfvars.
+    Grammar (informally): document := (key '=' value)*; value := STRING |
+    NUMBER | 'true' | 'false' | 'null' | '[' value* ']' | '{' (key '=' value)* '}'."""
+
+    def __init__(self, tokens: list[tuple[str, str]]):
+        self.tokens = tokens
+        self.i = 0
+
+    def _peek(self) -> tuple[str | None, str | None]:
+        return self.tokens[self.i] if self.i < len(self.tokens) else (None, None)
+
+    def _next(self) -> tuple[str | None, str | None]:
+        tok = self._peek()
+        self.i += 1
+        return tok
+
+    def _expect(self, kind: str) -> tuple[str, str]:
+        tok = self._next()
+        if tok[0] != kind:
+            raise TfvarsParseError(f"expected {kind}, got {tok[0] or 'end of file'}")
+        return tok
+
+    def _key(self) -> str:
+        kind, text = self._next()
+        if kind == "IDENT":
+            return text
+        if kind == "STRING":
+            return _unquote_tfvars_string(text)
+        raise TfvarsParseError(f"expected a variable/key name, got {kind or 'end of file'}")
+
+    def parse_document(self) -> dict:
+        result = {}
+        while self._peek()[0] is not None:
+            key = self._key()
+            self._expect("EQUALS")
+            result[key] = self.parse_value()
+        return result
+
+    def parse_value(self):
+        kind, text = self._next()
+        if kind == "STRING":
+            return _unquote_tfvars_string(text)
+        if kind == "NUMBER":
+            return float(text) if "." in text else int(text)
+        if kind == "IDENT":
+            if text == "true":
+                return True
+            if text == "false":
+                return False
+            if text == "null":
+                return None
+            # a bare identifier as a value means a variable/local reference --
+            # tfvars can't actually contain those (only literals), but keep
+            # this non-fatal and hand back the raw text rather than aborting
+            # the whole file's parse over one odd line.
+            return {"__ref__": text}
+        if kind == "LBRACKET":
+            items = []
+            while self._peek()[0] != "RBRACKET":
+                items.append(self.parse_value())
+                if self._peek()[0] == "COMMA":
+                    self._next()
+            self._expect("RBRACKET")
+            return items
+        if kind == "LBRACE":
+            obj = {}
+            while self._peek()[0] != "RBRACE":
+                key = self._key()
+                self._expect("EQUALS")
+                obj[key] = self.parse_value()
+                if self._peek()[0] == "COMMA":
+                    self._next()
+            self._expect("RBRACE")
+            return obj
+        raise TfvarsParseError(f"unexpected token {kind or 'end of file'} {text or ''}".strip())
+
+
+def parse_tfvars(text: str) -> dict:
+    return _TfvarsParser(_tokenize_tfvars(text)).parse_document()
+
+
+def get_tfvars(project_id: str) -> dict:
+    """Read and parse a project's tfvars file for the "pretty config" view --
+    read-only, no side effects. Always returns the raw file text (so the UI
+    can fall back to it), plus `parsed` (a nested dict) when parsing
+    succeeded or `parse_error` (a message) when it didn't -- deliberately
+    never raises just because the file has something this parser can't
+    handle."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    target = _target_for(project)
+    path = os.path.join(target["dir"], target["tfvars_relative"])
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except OSError as e:
+        raise ValueError(f"could not read {target['tfvars_relative']}: {e}")
+
+    try:
+        parsed = parse_tfvars(raw)
+        parse_error = None
+    except TfvarsParseError as e:
+        parsed = None
+        parse_error = str(e)
+
+    return {
+        "relative_path": target["tfvars_relative"],
+        "raw": raw,
+        "parsed": parsed,
+        "parse_error": parse_error,
+    }
 
 
 _SUBSCRIPTION_ID_RE = re.compile(r'subscription_id\s*=\s*"([^"]+)"')
@@ -712,7 +937,17 @@ def open_folder_dialog() -> str | None:
     server and the browser are on the same box for this tool) and return
     the chosen path, or None if the user cancelled. Blocks the calling
     thread until the dialog closes -- callers must run this off the event
-    loop (asyncio.to_thread)."""
+    loop (asyncio.to_thread).
+
+    Windows-only (WinForms via PowerShell) -- inside a Linux container (or
+    any non-Windows host) there's no GUI to pop a dialog on anyway, so this
+    fails fast with a message telling the user to type the path instead,
+    rather than a confusing 'powershell not found' error."""
+    if os.name != "nt":
+        raise RuntimeError(
+            "the native folder browser is Windows-only -- type the project path directly "
+            "(e.g. a path under a volume you mounted, like /workspace/my-project)"
+        )
     powershell_exe = _resolve_executable("powershell")
     result = subprocess.run(
         [powershell_exe, "-NoProfile", "-NonInteractive", "-Sta", "-Command", _FOLDER_PICKER_SCRIPT],
@@ -722,6 +957,98 @@ def open_folder_dialog() -> str | None:
     )
     path = result.stdout.strip()
     return path or None
+
+
+def open_in_vscode(project_id: str) -> dict:
+    """Launch VS Code (the `code` CLI) pointed at this project's ROOT folder
+    (not just the deployment subfolder) on this same machine -- a
+    convenience action, same spirit as open_folder_dialog above. Opening
+    just the deployment folder would hide the sibling modules/ directory
+    its own .tf files actually reference (relative paths), so the project
+    root -- modules/ and every tf-deployment*/ side by side -- is what's
+    actually useful to have open. Dashboard-only, not an MCP tool: this
+    opens a GUI window on the user's own desktop, which isn't something an
+    agent should trigger on your behalf. Fails clearly if `code` isn't on
+    PATH (fresh installs need "Shell Command: Install 'code' command in
+    PATH" from VS Code's own Command Palette) or if this dashboard is
+    running somewhere with no desktop to open a window on (e.g. Docker)."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+
+    try:
+        code_exe = _resolve_executable("code")
+    except RuntimeError:
+        raise ValueError(
+            "VS Code's 'code' command isn't on PATH -- in VS Code, open the Command Palette and run "
+            "\"Shell Command: Install 'code' command in PATH\", then try again"
+        )
+
+    try:
+        subprocess.Popen([code_exe, project["project_root"]], close_fds=True)
+    except OSError as e:
+        raise ValueError(f"could not launch VS Code: {e}")
+
+    return {"ok": True, "path": project["project_root"]}
+
+
+def count_active_runs() -> int:
+    """How many projects currently have an init/fmt/validate/plan/apply in
+    flight -- used by the dashboard to warn "this will interrupt N run(s)"
+    before a restart, rather than just a generic warning."""
+    with _runs_lock:
+        return len(_active_run_by_project)
+
+
+def restart_server() -> dict:
+    """Restart this whole server process via the same stop.ps1/start.ps1
+    PID-file mechanism the user would run by hand -- spawns a short,
+    detached PowerShell script that waits a couple seconds (long enough for
+    this request's HTTP response to actually reach the browser first), then
+    runs stop.ps1 (which kills *this* process by its own PID) followed by
+    start.ps1 (which launches the replacement). Deliberately not exposed as
+    an MCP tool -- restarting is disruptive (kills any run currently in
+    flight) and should only ever be a deliberate human action from the
+    dashboard, never something an agent decides to do on its own.
+
+    Windows-only (stop.ps1/start.ps1 are PowerShell) -- running in Docker,
+    restart the container instead (`docker compose restart`), which
+    achieves the same thing without needing this at all."""
+    if os.name != "nt":
+        raise ValueError(
+            "self-restart isn't supported outside Windows -- if this is running in Docker, "
+            "restart the container instead (`docker compose restart`)"
+        )
+    root = os.path.dirname(__file__)
+    stop_script = os.path.join(root, "stop.ps1")
+    start_script = os.path.join(root, "start.ps1")
+    script = (
+        "Start-Sleep -Seconds 2\n"
+        f'& "{stop_script}"\n'
+        "Start-Sleep -Seconds 1\n"
+        f'& "{start_script}"\n'
+    )
+    fd, script_path = tempfile.mkstemp(suffix=".ps1", prefix="iac-dashboard-restart-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(script)
+
+    powershell_exe = _resolve_executable("powershell")
+    # CREATE_NO_WINDOW, not DETACHED_PROCESS: powershell.exe tries to
+    # allocate a console for itself on launch, and DETACHED_PROCESS (no
+    # console at all) makes that allocation hang indefinitely -- the script
+    # never even reaches its first line. CREATE_NO_WINDOW gives it a real
+    # (just invisible) console instead, which is what actually lets it run
+    # unattended. stdin/out/err are explicitly closed rather than inherited
+    # from this process's own (already redirected-to-a-logfile) handles.
+    subprocess.Popen(
+        [powershell_exe, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", script_path],
+        creationflags=subprocess.CREATE_NO_WINDOW,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        close_fds=True,
+    )
+    return {"ok": True, "note": "restarting -- the dashboard will be unreachable for a few seconds"}
 
 
 # ===================================================================================
@@ -764,6 +1091,7 @@ class Run:
                 q.put(None)
         if self.kind in PERSISTED_KINDS:
             run_store.save_run(self)
+            _enforce_retention(self.target.get("project_id"))
 
     @classmethod
     def from_persisted(cls, d: dict) -> "Run":
@@ -990,6 +1318,47 @@ def _gc_run_data():
                 pass
 
 
+def _enforce_retention(project_id: str | None):
+    """Delete finished init/plan/apply runs older than that project's own
+    `retention_days` -- a per-project opt-in (unset/0 means "keep forever",
+    the historical behavior, so every project that predates this setting is
+    unaffected). A run still queued/running is never touched regardless of
+    age (there isn't one this old in practice, but the check is there so
+    this can never race a run that's still writing to itself).
+
+    Called after every init/plan/apply finishes (see Run.close) and once at
+    startup (covering runs that aged past the limit while the server was
+    down, or a retention_days lowered via update_project) -- so cleanup
+    happens automatically rather than needing a cron job or a button."""
+    if not project_id:
+        return
+    project = get_project(project_id)
+    if project is None:
+        return
+    days = project.get("retention_days")
+    if not days:
+        return
+    cutoff = time.time() - days * 86400
+
+    with _runs_lock:
+        to_remove = [
+            rid
+            for rid, r in _runs.items()
+            if r.target.get("project_id") == project_id
+            and r.kind in PERSISTED_KINDS
+            and r.status in ("success", "failed")
+            and r.created_at < cutoff
+        ]
+        for rid in to_remove:
+            del _runs[rid]
+
+    for rid in to_remove:
+        run_store.delete_run(rid)
+        run_dir = _run_data_dir(project_id, rid)
+        if os.path.isdir(run_dir):
+            shutil.rmtree(run_dir, ignore_errors=True)
+
+
 def bootstrap():
     """Call once at server startup: rehydrate run history from disk so a
     restart doesn't wipe it. Does NOT touch
@@ -999,6 +1368,10 @@ def bootstrap():
         run = Run.from_persisted(d)
         _runs[run.id] = run
     _gc_run_data()  # after loading, so runs still in history aren't mistaken for orphans
+    with _projects_lock:
+        projects = _load_projects()
+    for p in projects:
+        _enforce_retention(p["id"])
 
 
 def _run_terraform(run: Run, cwd: str, args: list[str], needs_arm_key: bool = True):

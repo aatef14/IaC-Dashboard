@@ -1,0 +1,28 @@
+# Same intent as .gitignore -- runtime state is machine-local and
+# regenerated on first run; none of it belongs baked into the image.
+organizations.json
+projects.json
+runs.db
+runs.db-journal
+runs.db-wal
+runs.db-shm
+project-data/
+server.log
+server.log.err
+.server.pid
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Windows-only helper scripts -- irrelevant inside the Linux image
+start.ps1
+stop.ps1

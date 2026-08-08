@@ -1,0 +1,22 @@
+services:
+  iac-dashboard:
+    build: .
+    # 127.0.0.1:8765:8765, not a bare "8765:8765" -- this tool can trigger
+    # real changes against real Azure subscriptions, so it must stay
+    # reachable only from this machine, never the wider network (matches
+    # the native app's HOST=127.0.0.1 default -- see server.py).
+    ports:
+      - "127.0.0.1:8765:8765"
+    volumes:
+      # Persists organizations.json/projects.json/runs.db/project-data/
+      # across container rebuilds -- without this, every rebuild starts
+      # from zero with no saved projects or run history.
+      - dashboard-data:/data
+      # Bind-mount your actual Terraform repo(s) here, then in "Add Work
+      # Project" type the in-container path (e.g. /workspace/my-repo) --
+      # the native folder-browser dialog doesn't work in a container.
+      - ./terraform-projects:/workspace
+    restart: unless-stopped
+
+volumes:
+  dashboard-data:
