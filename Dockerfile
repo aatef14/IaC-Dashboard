@@ -7,12 +7,15 @@
 #     path directly (e.g. under a volume you mounted).
 #   - the "Restart Server" button (spawns stop.ps1/start.ps1) -- restart the
 #     container instead: `docker compose restart`.
+# The in-app terminal DOES work here -- it uses ptyprocess (POSIX fork/exec)
+# instead of Windows' pywinpty, picked automatically by run_manager.py based
+# on os.name, running plain bash instead of Git Bash.
 FROM python:3.12-slim
 
 ARG TERRAFORM_VERSION=1.9.8
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl ca-certificates gnupg unzip \
+    && apt-get install -y --no-install-recommends curl ca-certificates gnupg unzip bash \
     && curl -sL https://aka.ms/InstallAzureCLIDeb | bash \
     && curl -sLo /tmp/terraform.zip \
          "https://releases.hashicorp.com/terraform/${TERRAFORM_VERSION}/terraform_${TERRAFORM_VERSION}_linux_amd64.zip" \

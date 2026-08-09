@@ -6,18 +6,39 @@
 <link rel="stylesheet" href="/style.css" />
 </head>
 <body>
+  <div id="bg-particles" aria-hidden="true"></div>
   <header>
     <div class="header-left">
-      <button id="btn-back" class="btn hidden">&larr; Projects</button>
-      <h1>IaC-Dashboard</h1>
+      <button id="btn-back" class="btn hidden" data-tip="Back" aria-label="Back">&larr;</button>
+      <nav id="breadcrumb" aria-label="Breadcrumb"></nav>
     </div>
     <div class="header-right">
-      <button id="btn-restart-server" class="btn danger-outline" data-tip="Restart the dashboard server&#10;Kills and relaunches this whole process (via stop.ps1/start.ps1).&#10;Interrupts any run currently in flight, for any project.">Restart Server</button>
-      <button id="btn-theme" class="btn" data-tip="Toggle dark mode" aria-label="Toggle dark mode">
-        <span class="theme-icon"></span>
-      </button>
+      <div class="notif-wrap">
+        <button id="btn-notif-bell" class="btn card-menu-btn header-menu-btn" data-tip="Notifications" aria-label="Notifications">
+          &#128276;<span id="notif-badge" class="notif-badge hidden">0</span>
+        </button>
+        <div id="notif-dropdown" class="notif-dropdown hidden"></div>
+      </div>
+      <button id="btn-header-menu" class="btn card-menu-btn header-menu-btn" data-tip="Menu" aria-label="Menu">&#9776;</button>
     </div>
   </header>
+
+  <!-- ===================== TOOLS VIEW ===================== -->
+  <main id="tools-view" class="hidden">
+    <h2>Tools</h2>
+    <div class="tool-card">
+      <h3>Name Availability Checker</h3>
+      <p class="muted">Several Azure resource types are namespaced across ALL of Azure, not just your subscription -- worth confirming before writing a name into tfvars. Checks live via the matching <code>az ... check-name</code> command; no particular subscription access required, just being signed in.</p>
+      <label class="field-label">Service</label>
+      <select id="name-availability-service-select"></select>
+      <p id="name-availability-hint" class="muted name-availability-hint"></p>
+      <div class="confirm-row">
+        <input id="storage-name-input" placeholder="e.g. myuniquename123" />
+        <button id="btn-check-storage-name" class="btn primary">Check</button>
+      </div>
+      <div id="storage-name-result" class="tool-result hidden"></div>
+    </div>
+  </main>
 
   <!-- ===================== LANDING VIEW (Organizations) ===================== -->
   <main id="landing-view">
@@ -27,6 +48,7 @@
     </div>
 
     <h2>Organizations</h2>
+    <input id="org-search-input" class="search-input" placeholder="Search organizations…" />
     <div id="orgs-grid" class="projects-grid"></div>
     <p id="no-orgs-msg" class="muted hidden">No organizations yet — click "New Organization" to create one. Projects live inside an organization, so this comes first.</p>
   </main>
@@ -38,6 +60,7 @@
       <button id="btn-add-project" class="btn primary">+ Add Work Project</button>
     </div>
 
+    <input id="project-search-input" class="search-input" placeholder="Search work projects…" />
     <div id="projects-grid" class="projects-grid"></div>
     <p id="no-projects-msg" class="muted hidden">No work projects yet in this organization — click "Add Work Project" to set one up.</p>
   </main>
@@ -48,6 +71,7 @@
       <h2 id="workspace-project-name"></h2>
       <div class="pills" id="workspace-pills"></div>
       <button id="btn-open-vscode" class="btn" data-tip="Open this project's root folder in VS Code, on this same machine.&#10;The root, not just the deployment folder -- so modules/ (referenced by relative path) is visible alongside it.&#10;Requires the 'code' command on PATH (VS Code Command Palette -&gt; &quot;Shell Command: Install 'code' command in PATH&quot;).">Open in VS Code</button>
+      <button id="btn-open-editor" class="btn" data-tip="Open an in-app code editor for this project's files (.tf/.tfvars/etc) in a new tab -- saves write straight to disk. Blocked while a run is in progress.">Edit Files</button>
     </div>
 
     <div id="workspace-body">
@@ -58,6 +82,8 @@
         <button id="btn-validate" class="btn" disabled>Validate</button>
       </div>
       <button id="btn-view-tfvars" class="btn full-width" data-tip="View this project's tfvars file parsed into a readable tree, instead of raw HCL text.">View Config (tfvars)</button>
+      <button id="btn-view-state" class="btn full-width" data-tip="Browse what's actually deployed per the last-refreshed Terraform state -- no plan or Azure portal required.">View Deployed State</button>
+      <button id="btn-view-sources" class="btn full-width" data-tip="Modules and providers this deployment's own .tf files declare, with their pinned/constrained versions.">Modules &amp; Providers</button>
       <label class="field-label">Plan name</label>
       <input id="plan-name-input" placeholder="e.g. before refactor" />
       <div class="btn-row">
@@ -80,6 +106,7 @@
       <div id="plan-view-toolbar" class="hidden">
         <span id="plan-diff-counts"></span>
         <div class="toolbar-actions">
+          <button id="btn-toggle-all-diff" class="btn">Expand all</button>
           <a id="btn-download-json" class="btn" download>Download JSON</a>
           <a id="btn-download-csv" class="btn" download>Download CSV</a>
           <button id="btn-compare-plan" class="btn">Compare with...</button>
@@ -88,6 +115,7 @@
       </div>
 
       <div id="plan-diff-container" class="hidden">
+        <input id="diff-filter-input" class="search-input diff-filter-input" placeholder="Filter by resource address…" />
         <table id="plan-diff-table">
           <thead><tr><th>Action</th><th>Resource</th><th>Changed fields</th></tr></thead>
           <tbody></tbody>
@@ -114,6 +142,7 @@
           <p id="confirm-warning-text" class="warn-text"></p>
           <div class="confirm-row">
             <code id="confirm-token"></code>
+            <button id="btn-copy-confirm-token" class="btn" data-tip="Copy code" aria-label="Copy confirmation code">&#128203;</button>
             <span id="confirm-expiry" class="muted"></span>
           </div>
           <div class="confirm-row">
@@ -123,6 +152,53 @@
         </div>
       </div>
     </section>
+    </div>
+  </main>
+
+  <!-- ===================== FILE EDITOR ===================== -->
+  <main id="editor-view" class="hidden">
+    <div id="editor-title-bar">
+      <h2 id="editor-project-name"></h2>
+      <span id="editor-file-path" class="mono-path"></span>
+      <span id="editor-dirty-badge" class="dirty-badge hidden">unsaved changes</span>
+      <span id="editor-blocked-badge" class="dirty-badge blocked hidden" data-tip="A run is in progress for this project -- saving is blocked until it finishes.">run in progress -- saving blocked</span>
+      <div class="editor-title-actions">
+        <button id="btn-toggle-terminal" class="btn" data-tip="Open a real terminal, cwd fixed to this project's own deployment folder.">Terminal</button>
+        <div class="save-btn-wrap">
+          <button id="btn-save-file" class="btn primary" disabled>
+            Save
+            <span id="autosave-indicator" class="autosave-dot hidden" data-tip="Auto-save is on"></span>
+          </button>
+          <div class="save-options-popover">
+            <label class="save-autosave-toggle" data-tip="Saves 1.5s after you stop typing">
+              <input type="checkbox" id="chk-autosave" />
+              Auto-save
+            </label>
+          </div>
+        </div>
+      </div>
+    </div>
+    <div id="editor-body">
+      <aside id="editor-file-tree">
+        <div class="editor-tree-toolbar">
+          <input id="editor-file-filter" class="search-input" placeholder="Filter files…" />
+          <button id="btn-toggle-all-editor-dirs" class="btn" data-tip="Expand every folder">Expand all</button>
+        </div>
+        <div id="editor-file-tree-list"></div>
+      </aside>
+      <div id="editor-pane">
+        <div id="editor-empty-state" class="muted">Select a file on the left to start editing.</div>
+        <div id="monaco-container" class="hidden"></div>
+      </div>
+    </div>
+    <div id="terminal-panel" class="hidden">
+      <div id="terminal-panel-header">
+        <span id="terminal-panel-title">Terminal</span>
+        <span id="terminal-status" class="muted"></span>
+        <button id="btn-restart-terminal" class="btn" data-tip="Kill this shell and start a fresh one">Restart</button>
+        <button id="btn-close-terminal" class="btn" aria-label="Close terminal">&times;</button>
+      </div>
+      <div id="xterm-container"></div>
     </div>
   </main>
 
@@ -307,6 +383,30 @@
       <p id="tfvars-error" class="warn-text hidden"></p>
       <div id="tfvars-tree" class="tfv-tree"></div>
       <pre id="tfvars-raw" class="hidden"></pre>
+      <div class="modal-actions">
+        <button class="btn modal-close">Close</button>
+      </div>
+    </div>
+
+    <div id="state-modal" class="modal modal-wide hidden">
+      <h2>Deployed State</h2>
+      <p id="state-summary" class="muted"></p>
+      <input id="state-filter-input" class="search-input" placeholder="Filter by address, type, or name…" />
+      <p id="state-error" class="warn-text hidden"></p>
+      <div id="state-list" class="state-list"></div>
+      <div class="modal-actions">
+        <button class="btn modal-close">Close</button>
+      </div>
+    </div>
+
+    <div id="sources-modal" class="modal modal-wide hidden">
+      <h2>Modules &amp; Providers</h2>
+      <p class="muted">Parsed from this deployment's own .tf files (not the lock file) -- what it actually declares it depends on.</p>
+      <p id="sources-error" class="warn-text hidden"></p>
+      <h3>Modules</h3>
+      <div id="sources-modules-list" class="sources-list"></div>
+      <h3>Required Providers</h3>
+      <div id="sources-providers-list" class="sources-list"></div>
       <div class="modal-actions">
         <button class="btn modal-close">Close</button>
       </div>

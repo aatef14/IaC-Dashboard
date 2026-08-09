@@ -12,9 +12,14 @@ Two persistent concepts:
 
 Nothing about any particular deployment is hardcoded: the state storage
 account used to fetch ARM_ACCESS_KEY is read from each project's own
-.tfbackend file. Never accepts arbitrary shell input from a request -- only
-ever runs `az`, `terraform`, and (for the folder picker) a fixed PowerShell
-snippet.
+.tfbackend file.
+
+Every dashboard-triggered action here runs a specific, fixed command (`az`,
+`terraform`, or a fixed PowerShell snippet for the folder picker) -- except
+the in-app terminal (see TerminalSession below), which is a real PTY running
+a real shell and therefore CAN run arbitrary commands by design. That's the
+one deliberate exception to "never arbitrary shell input"; everything else
+in this module still holds to it.
 """
 
 import glob
@@ -31,6 +36,19 @@ import run_store
 import threading
 import time
 import uuid
+
+# Real PTY backend for the in-app terminal -- different packages per
+# platform since there's no single one that works everywhere: pywinpty
+# wraps Windows' ConPTY, ptyprocess wraps POSIX fork/exec (used inside the
+# Linux container image). Their PtyProcess.spawn/read/write/isalive/
+# setwinsize APIs are intentionally near-identical, but NOT the pid
+# attribute (winpty: proc.pty.pid, ptyprocess: proc.pid directly) --
+# TerminalSession.close() branches on os.name for exactly that reason.
+if os.name == "nt":
+    import winpty as _pty_backend
+else:
+    import ptyprocess as _pty_backend
+    import signal
 
 CONFIRMATION_TTL_SECONDS = 10 * 60
 PLAN_FILE_TTL_SECONDS = 30 * 60
@@ -390,18 +408,32 @@ def add_project(
     return project
 
 
+def _last_persisted_run_for_project(project_id: str) -> "Run | None":
+    """Most recent init/plan/apply for this project (fmt/validate excluded,
+    same "meaningful audit trail" definition as list_runs_summary) -- used
+    to show a health-at-a-glance status on the project card without having
+    to open it."""
+    candidates = [r for r in _runs.values() if r.target.get("project_id") == project_id and r.kind in PERSISTED_KINDS]
+    return max(candidates, key=lambda r: r.created_at) if candidates else None
+
+
 def _decorate(project: dict) -> dict:
     """Add derived, non-stored fields to a project before it goes out over
-    the API: whether it's init'd, and which tfvars/backend files this
-    deployment+environment actually resolves to. Exposing the filenames
+    the API: whether it's init'd, which tfvars/backend files this
+    deployment+environment actually resolves to (exposing the filenames
     keeps the naming convention defined in exactly one place (_target_for)
-    instead of the dashboard's JS re-deriving it and drifting."""
+    instead of the dashboard's JS re-deriving it and drifting), and its most
+    recent run's outcome."""
     target = _target_for(project)
+    last_run = _last_persisted_run_for_project(project["id"])
     return {
         **project,
         "initialized": _is_initialized(project),
         "tfvars_relative": target["tfvars_relative"],
         "backend_relative": target["backend_relative"],
+        "last_run": {"kind": last_run.kind, "status": last_run.status, "created_at": last_run.created_at}
+        if last_run
+        else None,
     }
 
 
@@ -695,6 +727,456 @@ def get_tfvars(project_id: str) -> dict:
     }
 
 
+# ===================================================================================
+# STATE RESOURCE BROWSER
+# ===================================================================================
+
+# Common Terraform/Azure attribute names worth surfacing as an at-a-glance
+# summary next to a resource's address -- picked by priority so e.g. a
+# storage account shows its SKU/tier rather than its (usually less useful)
+# location first. Only scalar values are ever shown; anything not present
+# (or not a plain string/number/bool) on a given resource is skipped.
+_STATE_HIGHLIGHT_ATTR_PRIORITY = [
+    "sku_name",
+    "sku",
+    "sku_tier",
+    "account_tier",
+    "account_replication_type",
+    "tier",
+    "vm_size",
+    "size",
+    "capacity",
+    "kind",
+    "os_type",
+    "storage_account_type",
+    "publisher",
+    "location",
+]
+
+
+def _state_resource_highlights(values: dict, limit: int = 3) -> list[list[str]]:
+    highlights = []
+    for key in _STATE_HIGHLIGHT_ATTR_PRIORITY:
+        value = values.get(key)
+        if isinstance(value, (str, int, float, bool)) and value != "":
+            highlights.append([key, str(value)])
+        if len(highlights) >= limit:
+            break
+    return highlights
+
+
+def _flatten_state_resources(module: dict, module_address: str = "") -> list[dict]:
+    """Recursively walks a `terraform show -json` module tree into a flat
+    list, one entry per *managed* resource (data sources are skipped -- they
+    aren't "deployed" infrastructure)."""
+    resources = []
+    for r in module.get("resources", []):
+        if r.get("mode") != "managed":
+            continue
+        values = r.get("values") or {}
+        resources.append(
+            {
+                "address": r["address"],
+                "type": r["type"],
+                "name": r["name"],
+                "provider_name": r.get("provider_name", ""),
+                "module": module_address or "(root)",
+                "display_name": values.get("name") if isinstance(values.get("name"), str) else r["name"],
+                "highlights": _state_resource_highlights(values),
+            }
+        )
+    for child in module.get("child_modules", []):
+        resources.extend(_flatten_state_resources(child, child.get("address", module_address)))
+    return resources
+
+
+def _find_state_resource(module: dict, address: str) -> dict | None:
+    for r in module.get("resources", []):
+        if r.get("address") == address:
+            return r
+    for child in module.get("child_modules", []):
+        found = _find_state_resource(child, address)
+        if found is not None:
+            return found
+    return None
+
+
+def _run_terraform_show(cwd: str) -> dict:
+    terraform_exe = _resolve_executable("terraform")
+    proc = subprocess.run([terraform_exe, "show", "-json"], cwd=cwd, capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0:
+        raise ValueError(f"terraform show failed: {(proc.stderr or proc.stdout).strip()}")
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"could not parse terraform show output: {e}")
+
+
+def get_state_resources(project_id: str) -> list[dict]:
+    """What's actually deployed per the last-refreshed state -- lets you
+    check what's live without opening the Azure portal or running a plan.
+    `terraform show -json` (no plan file argument) reads the current state
+    and is read-only: it doesn't touch Azure or take the state lock."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    if not _is_initialized(project):
+        raise ValueError("project has not been initialized yet -- call init_project first")
+    cwd = os.path.join(project["project_root"], project["deployment"])
+    data = _run_terraform_show(cwd)
+    root_module = (data.get("values") or {}).get("root_module")
+    if root_module is None:
+        return []  # valid, empty state -- nothing applied yet
+    return _flatten_state_resources(root_module)
+
+
+def get_state_resource_detail(project_id: str, address: str) -> dict:
+    """Full attribute values for one resource in state, sensitive values
+    redacted the same way plan diffs are."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    if not _is_initialized(project):
+        raise ValueError("project has not been initialized yet -- call init_project first")
+    cwd = os.path.join(project["project_root"], project["deployment"])
+    data = _run_terraform_show(cwd)
+    root_module = (data.get("values") or {}).get("root_module")
+    resource = _find_state_resource(root_module, address) if root_module else None
+    if resource is None:
+        raise ValueError(f"resource '{address}' not found in state")
+    return {
+        "address": resource["address"],
+        "type": resource["type"],
+        "name": resource["name"],
+        "provider_name": resource.get("provider_name", ""),
+        "values": _redact_sensitive(resource.get("values") or {}, resource.get("sensitive_values") or {}),
+    }
+
+
+# ===================================================================================
+# MODULE / PROVIDER SOURCE EXPLORER
+# ===================================================================================
+
+_MODULE_HEADER_RE = re.compile(r'module\s+"([^"]+)"\s*\{')
+_REQUIRED_PROVIDERS_HEADER_RE = re.compile(r'required_providers\s*\{')
+_PROVIDER_REQUIREMENT_HEADER_RE = re.compile(r'([A-Za-z0-9_-]+)\s*=\s*\{')
+_SOURCE_KV_RE = re.compile(r'^\s*source\s*=\s*"([^"]+)"', re.MULTILINE)
+_VERSION_KV_RE = re.compile(r'^\s*version\s*=\s*"([^"]+)"', re.MULTILINE)
+
+
+def _extract_braced_body(content: str, open_brace_pos: int) -> str:
+    """content[open_brace_pos] must be "{". Returns everything up to its
+    matching closing brace, found by tracking nesting depth rather than a
+    bounded-depth regex -- real module bodies nest several levels deep
+    (a `for` expression building a map of objects, each containing a
+    `merge(...)` call with its own `{}` literal, etc.), which a
+    fixed-depth-tolerant regex silently mis-matches or drops entirely."""
+    depth = 0
+    for i in range(open_brace_pos, len(content)):
+        if content[i] == "{":
+            depth += 1
+        elif content[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return content[open_brace_pos + 1 : i]
+    return content[open_brace_pos + 1 :]  # unterminated (shouldn't happen in valid HCL) -- return what's there
+
+
+def _strip_commented_lines(content: str) -> str:
+    """Drops whole lines that are entirely a `#`/`//` comment before
+    regex-scanning for module/provider blocks -- otherwise an entire
+    commented-out module block (this codebase's convention for "kept around
+    in case we need it again") would be reported as a real dependency.
+    Doesn't handle a trailing same-line comment or /* */ block comments;
+    good enough for how this repo actually comments things out, not a real
+    HCL parser."""
+    return "\n".join(line for line in content.splitlines() if not line.strip().startswith(("#", "//")))
+
+
+def get_module_and_provider_sources(project_id: str) -> dict:
+    """Parses this deployment's own .tf files (not the lock file) for
+    `module` blocks (source + version pin) and the `required_providers`
+    block (source + version constraint) -- "what does this deployment
+    actually declare it depends on," without grepping through files by
+    hand."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    cwd = os.path.join(project["project_root"], project["deployment"])
+    modules = []
+    providers = []
+    if os.path.isdir(cwd):
+        for fname in sorted(os.listdir(cwd)):
+            if not fname.endswith(".tf"):
+                continue
+            try:
+                with open(os.path.join(cwd, fname), "r", encoding="utf-8") as f:
+                    content = _strip_commented_lines(f.read())
+            except OSError:
+                continue
+
+            for m in _MODULE_HEADER_RE.finditer(content):
+                body = _extract_braced_body(content, m.end() - 1)
+                source_match = _SOURCE_KV_RE.search(body)
+                version_match = _VERSION_KV_RE.search(body)
+                modules.append(
+                    {
+                        "name": m.group(1),
+                        "source": source_match.group(1) if source_match else "unknown",
+                        "version": version_match.group(1) if version_match else None,
+                        "file": fname,
+                    }
+                )
+
+            for rp_m in _REQUIRED_PROVIDERS_HEADER_RE.finditer(content):
+                rp_body = _extract_braced_body(content, rp_m.end() - 1)
+                for prov_m in _PROVIDER_REQUIREMENT_HEADER_RE.finditer(rp_body):
+                    prov_body = _extract_braced_body(rp_body, prov_m.end() - 1)
+                    source_match = _SOURCE_KV_RE.search(prov_body)
+                    version_match = _VERSION_KV_RE.search(prov_body)
+                    providers.append(
+                        {
+                            "name": prov_m.group(1),
+                            "source": source_match.group(1) if source_match else None,
+                            "version_constraint": version_match.group(1) if version_match else None,
+                            "file": fname,
+                        }
+                    )
+    return {"modules": modules, "providers": providers}
+
+
+# ===================================================================================
+# FILE EDITOR
+# ===================================================================================
+
+# Directories never worth showing in the editor's file tree: VCS metadata
+# and terraform's own provider/plugin cache (which is enormous and none of
+# it is meant to be hand-edited).
+_EDITOR_SKIP_DIRS = {".git", ".terraform", "__pycache__", "node_modules", ".vscode", ".idea"}
+
+# This editor opens text files a Terraform project actually contains, not
+# arbitrary bytes -- deliberately NOT extension-less/binary-safe, since
+# refusing anything outside this list is what keeps "write to any file on
+# disk" from actually meaning arbitrary bytes.
+_EDITOR_ALLOWED_EXTENSIONS = {
+    ".tf", ".tfvars", ".tfbackend", ".hcl",
+    ".md", ".txt", ".json", ".yaml", ".yml",
+    ".cfg", ".ini",
+}
+_EDITOR_ALLOWED_BASENAMES = {".gitignore", ".env"}
+_EDITOR_MAX_FILE_SIZE = 2 * 1024 * 1024  # 2 MB -- generous for any real .tf file
+
+
+def _editor_is_allowed_file(filename: str) -> bool:
+    if filename in _EDITOR_ALLOWED_BASENAMES:
+        return True
+    _, ext = os.path.splitext(filename)
+    return ext.lower() in _EDITOR_ALLOWED_EXTENSIONS
+
+
+def _editor_allowed_roots(project: dict) -> list[str]:
+    """Only these two folders are ever exposed to the in-app editor -- the
+    shared modules/ directory and THIS project's own configured deployment
+    folder. Not project_root as a whole: that can (and typically does)
+    contain sibling tf-deployment-*/ folders belonging to other
+    projects/environments this project has no business touching, plus
+    whatever else lives at the repo root (.git, .claude, CI config...).
+    Scoping to exactly what this project's own settings name is the actual
+    security boundary here, not just a UI convenience."""
+    root = project["project_root"]
+    return [os.path.join(root, "modules"), os.path.join(root, project["deployment"])]
+
+
+def _resolve_editor_path(project: dict, relative_path: str) -> str:
+    """Resolves relative_path against this project's root and guarantees
+    the result falls inside one of _editor_allowed_roots -- the one thing
+    that must never be wrong here, since callers read AND write real files
+    on the user's disk. A `..` segment (or an absolute path smuggled in as
+    "relative") that escapes those folders is rejected outright, never
+    silently reinterpreted."""
+    root = os.path.realpath(project["project_root"])
+    candidate = os.path.realpath(os.path.join(root, relative_path))
+    candidate_norm = os.path.normcase(candidate)
+    allowed = [os.path.normcase(os.path.realpath(p)) for p in _editor_allowed_roots(project)]
+    if not any(candidate_norm == a or candidate_norm.startswith(a + os.sep) for a in allowed):
+        raise ValueError("path is outside the editable folders for this project (modules/ and its own deployment folder only)")
+    return candidate
+
+
+def list_project_files(project_id: str) -> list[dict]:
+    """File tree for the in-app editor's file browser, scoped to exactly
+    _editor_allowed_roots (not the whole project_root -- see that
+    function). Lists everything in those folders except _EDITOR_SKIP_DIRS,
+    and marks which entries this editor will actually open (`editable`) so
+    the UI can grey out lockfiles/binaries instead of hiding them outright."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    root = project["project_root"]
+    if not os.path.isdir(root):
+        raise ValueError("project folder does not exist on disk")
+
+    entries = []
+    for allowed_root in _editor_allowed_roots(project):
+        if not os.path.isdir(allowed_root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(allowed_root):
+            dirnames[:] = [d for d in dirnames if d not in _EDITOR_SKIP_DIRS]
+            rel_dir = os.path.relpath(dirpath, root)
+            for fname in sorted(filenames):
+                rel_path = fname if rel_dir == "." else os.path.join(rel_dir, fname)
+                full_path = os.path.join(dirpath, fname)
+                try:
+                    size = os.path.getsize(full_path)
+                except OSError:
+                    size = 0
+                entries.append(
+                    {
+                        "path": rel_path.replace("\\", "/"),
+                        "size": size,
+                        "editable": _editor_is_allowed_file(fname) and size <= _EDITOR_MAX_FILE_SIZE,
+                    }
+                )
+    entries.sort(key=lambda e: e["path"].lower())
+    return entries
+
+
+def read_project_file(project_id: str, relative_path: str) -> dict:
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    full_path = _resolve_editor_path(project, relative_path)
+    if not os.path.isfile(full_path):
+        raise ValueError("file does not exist")
+    if not _editor_is_allowed_file(os.path.basename(full_path)):
+        raise ValueError("this file type isn't editable here")
+    size = os.path.getsize(full_path)
+    if size > _EDITOR_MAX_FILE_SIZE:
+        raise ValueError(f"file is too large to edit here ({size} bytes)")
+    try:
+        with open(full_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except UnicodeDecodeError:
+        raise ValueError("file is not valid UTF-8 text -- can't be opened in this editor")
+    return {"path": relative_path.replace("\\", "/"), "content": content, "size": size}
+
+
+def write_project_file(project_id: str, relative_path: str, content: str) -> dict:
+    """Overwrites a project file with new content. Refuses while a run is
+    in progress for this project -- terraform reads these files from disk
+    mid-run (a plan starting right as a save lands could plan against a
+    half-written file; a save mid-apply could disagree with what the apply
+    is already acting on), so this is "don't write while anything's
+    reading," not just politeness. Can only edit a file that already exists
+    -- no file creation from here."""
+    if project_id in _active_run_by_project:
+        raise ValueError("a run is currently in progress for this project -- wait for it to finish before saving")
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    full_path = _resolve_editor_path(project, relative_path)
+    if not _editor_is_allowed_file(os.path.basename(full_path)):
+        raise ValueError("this file type isn't editable here")
+    if not os.path.isfile(full_path):
+        raise ValueError("file does not exist -- this editor can only edit existing files, not create new ones")
+    with open(full_path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+    return {"ok": True, "path": relative_path.replace("\\", "/"), "size": os.path.getsize(full_path)}
+
+
+# ===================================================================================
+# TERMINAL (real PTY -- see the module docstring's one deliberate exception)
+# ===================================================================================
+
+
+class TerminalSession:
+    """One real pseudo-terminal running Git Bash (Windows, via pywinpty's
+    ConPTY wrapper) or plain bash (inside the Linux container image, via
+    ptyprocess's POSIX fork/exec), cwd fixed at spawn time to a project's
+    own deployment folder -- never user-changeable at creation, always
+    exactly where init/plan/apply run. One session per browser tab's
+    terminal connection; server.py's websocket handler owns its lifecycle
+    (spawn on connect, close on disconnect). Output is read on a background
+    thread (the backend's read() is a blocking call) and handed off through
+    a queue to whatever's pumping it out to the websocket."""
+
+    def __init__(self, cwd: str, shell_argv: list[str]):
+        self.proc = _pty_backend.PtyProcess.spawn(shell_argv, cwd=cwd, dimensions=(24, 80))
+        self.output_queue: "queue.Queue" = queue.Queue()
+        self._thread = threading.Thread(target=self._read_loop, daemon=True)
+        self._thread.start()
+
+    def _read_loop(self):
+        try:
+            while self.proc.isalive():
+                try:
+                    data = self.proc.read(4096)
+                except EOFError:
+                    break
+                if not data:
+                    break
+                self.output_queue.put(data)
+        finally:
+            self.output_queue.put(None)  # sentinel -- tells the pump loop the session is done
+
+    def write(self, data: str):
+        if self.proc.isalive():
+            self.proc.write(data)
+
+    def resize(self, rows: int, cols: int):
+        if self.proc.isalive():
+            try:
+                self.proc.setwinsize(rows, cols)
+            except Exception:  # noqa: BLE001 - a resize race (process just exited) shouldn't kill the connection
+                pass
+
+    def close(self):
+        # PtyProcess.terminate() only signals the PTY host/session leader --
+        # on Windows that's the ConPTY agent, not the real bash.exe tree it
+        # launched (verified empirically: orphaned bash.exe survived every
+        # close/restart). Killing the real process tree by pid is the
+        # actual fix, and the mechanics differ per platform: taskkill /T on
+        # Windows (same fix already used for cancel_run's terraform
+        # processes), killpg on POSIX -- safe there because ptyprocess
+        # calls os.setsid() right after fork, making the shell its own
+        # session AND process group leader (pid == pgid), so killing that
+        # group takes any children (including background jobs) with it.
+        pid = None
+        try:
+            pid = self.proc.pty.pid if os.name == "nt" else self.proc.pid
+        except Exception:  # noqa: BLE001 - if we can't get a pid there's nothing more targeted to do
+            pass
+        if pid:
+            try:
+                if os.name == "nt":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=15, check=False)
+                else:
+                    os.killpg(pid, signal.SIGKILL)
+            except (OSError, subprocess.SubprocessError, ProcessLookupError, PermissionError):
+                pass
+        try:
+            self.proc.terminate(force=True)
+        except Exception:  # noqa: BLE001 - already dead is fine, this is best-effort cleanup
+            pass
+
+
+def spawn_terminal(project_id: str) -> TerminalSession:
+    """Opens a new terminal for this project, cwd fixed to its own
+    configured deployment folder -- the whole point being that it always
+    starts exactly where init/plan/apply do, not project_root or wherever
+    the server process happens to be running from. Shell is always
+    resolved via PATH (bash on both platforms -- Git Bash on Windows, the
+    container's own /bin/bash on Linux), never hardcoded to one location."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    cwd = os.path.join(project["project_root"], project["deployment"])
+    if not os.path.isdir(cwd):
+        raise ValueError("deployment folder does not exist on disk")
+    bash_exe = _resolve_executable("bash")
+    return TerminalSession(cwd, [bash_exe, "--login", "-i"])
+
+
 _SUBSCRIPTION_ID_RE = re.compile(r'subscription_id\s*=\s*"([^"]+)"')
 
 
@@ -876,6 +1358,124 @@ def check_auth(project_id: str) -> dict:
         raise ValueError("unknown project_id")
     target = _target_for(project)
     return _auth_verdict(_azure_auth_state(target), target)
+
+
+# ===================================================================================
+# STANDALONE AZURE TOOLS -- not tied to any saved project (see "Tools" in the header menu)
+# ===================================================================================
+
+def _check_name_availability_json_shaped(cmd_args: list[str], name: str) -> dict:
+    """Shared by every `az ... check-name --name X` command whose JSON
+    response is shaped {"nameAvailable": bool, "reason": ..., "message":
+    ...} -- true of storage accounts, key vaults, and container registries
+    alike, so one helper covers all three."""
+    try:
+        az = _resolve_executable("az")
+    except RuntimeError as e:
+        raise ValueError(str(e))
+
+    result = subprocess.run(
+        [az, *cmd_args, "--name", name, "-o", "json"], capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise ValueError(f"az {' '.join(cmd_args)} failed: {result.stderr.strip()[:400]}")
+    try:
+        data = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        raise ValueError("could not parse az's response")
+
+    return {"name_available": bool(data.get("nameAvailable")), "reason": data.get("reason"), "message": data.get("message")}
+
+
+def _check_cosmosdb_name(name: str) -> dict:
+    """Cosmos DB is the odd one out: `az cosmosdb check-name-exists` returns
+    a bare "true"/"false" (name TAKEN, not available), not a JSON object --
+    normalized here to the same {name_available, reason, message} shape the
+    other three services return, so the caller doesn't need to care which
+    service it asked about."""
+    try:
+        az = _resolve_executable("az")
+    except RuntimeError as e:
+        raise ValueError(str(e))
+
+    result = subprocess.run(
+        [az, "cosmosdb", "check-name-exists", "--name", name], capture_output=True, text=True, timeout=30
+    )
+    if result.returncode != 0:
+        raise ValueError(f"az cosmosdb check-name-exists failed: {result.stderr.strip()[:400]}")
+    taken = result.stdout.strip().lower() == "true"
+    return {
+        "name_available": not taken,
+        "reason": "AlreadyExists" if taken else None,
+        "message": f"The Cosmos DB account name '{name}' is already taken." if taken else None,
+    }
+
+
+# One entry per checkable service: a validation regex + human hint (checked
+# locally first, since Azure would just reject an invalid name outright --
+# no need to spend a network round trip finding that out), and the actual
+# check. Order here is the order options appear in the dashboard's dropdown.
+_NAME_AVAILABILITY_SERVICES = {
+    "storage_account": {
+        "label": "Storage Account",
+        "pattern": re.compile(r"^[a-z0-9]{3,24}$"),
+        "pattern_hint": "3-24 characters, lowercase letters and numbers only",
+        "check": lambda name: _check_name_availability_json_shaped(["storage", "account", "check-name"], name),
+    },
+    "key_vault": {
+        "label": "Key Vault",
+        "pattern": re.compile(r"^[A-Za-z][A-Za-z0-9-]{1,22}[A-Za-z0-9]$"),
+        "pattern_hint": "3-24 characters, letters/numbers/hyphens, starting with a letter and ending with a letter or digit",
+        "check": lambda name: _check_name_availability_json_shaped(["keyvault", "check-name"], name),
+    },
+    "container_registry": {
+        "label": "Container Registry",
+        "pattern": re.compile(r"^[a-zA-Z0-9]{5,50}$"),
+        "pattern_hint": "5-50 characters, letters and numbers only (no hyphens)",
+        "check": lambda name: _check_name_availability_json_shaped(["acr", "check-name"], name),
+    },
+    "cosmosdb_account": {
+        "label": "Cosmos DB Account",
+        "pattern": re.compile(r"^[a-z0-9]([a-z0-9-]{1,48}[a-z0-9])?$"),
+        "pattern_hint": "3-50 characters, lowercase letters, numbers, and hyphens",
+        "check": lambda name: _check_cosmosdb_name(name),
+    },
+}
+
+
+def list_name_availability_services() -> list[dict]:
+    return [{"id": key, "label": svc["label"], "pattern_hint": svc["pattern_hint"]} for key, svc in _NAME_AVAILABILITY_SERVICES.items()]
+
+
+def check_name_availability(service: str, name: str) -> dict:
+    """Check whether a name is globally available for the given Azure
+    service -- storage accounts, key vaults, container registries, and
+    Cosmos DB accounts are all namespaced across ALL of Azure, not just one
+    subscription, which is exactly the kind of thing worth confirming
+    before committing a name to tfvars (this project's own scaffolded/real
+    tfvars already carry "CONFIRM with `az ... check-name`" comments next
+    to names like this). Read-only, no side effects, and doesn't need a
+    saved project -- any signed-in `az login` is enough, no particular
+    subscription access required."""
+    svc = _NAME_AVAILABILITY_SERVICES.get(service)
+    if svc is None:
+        raise ValueError(f"unknown service '{service}' -- choose one of: {', '.join(_NAME_AVAILABILITY_SERVICES)}")
+
+    name = (name or "").strip()
+    if not name:
+        raise ValueError("enter a name to check")
+
+    if not svc["pattern"].match(name):
+        result = {
+            "name_available": False,
+            "reason": "InvalidName",
+            "message": f"must be {svc['pattern_hint']} (Azure would reject the request outright, "
+            "so this is checked locally first)",
+        }
+    else:
+        result = svc["check"](name)
+
+    return {"service": service, "name": name, **result}
 
 
 def _check_plan_not_stale(run: "Run"):
@@ -1153,6 +1753,107 @@ def _resolve_executable(name: str) -> str:
     return resolved
 
 
+_terraform_version_cache: str | None = None
+
+
+def get_terraform_version() -> str:
+    """The installed Terraform CLI's version -- useful for debugging
+    "works on my machine" module-compatibility issues. Cached for the
+    process lifetime since it can't change without a restart."""
+    global _terraform_version_cache
+    if _terraform_version_cache is not None:
+        return _terraform_version_cache
+    try:
+        terraform_exe = _resolve_executable("terraform")
+        result = subprocess.run([terraform_exe, "version", "-json"], capture_output=True, text=True, timeout=15)
+        data = json.loads(result.stdout)
+        _terraform_version_cache = data.get("terraform_version", "unknown")
+    except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        _terraform_version_cache = "unknown"
+    return _terraform_version_cache
+
+
+_LOCK_PROVIDER_BLOCK_RE = re.compile(
+    r'provider\s+"([^"]+)"\s*\{[^}]*?version\s*=\s*"([^"]+)"', re.DOTALL
+)
+
+
+def _parse_lock_file_versions(lock_path: str) -> dict:
+    """Pinned provider versions from a `.terraform.lock.hcl` file, keyed by
+    the same registry address terraform version -json uses (e.g.
+    "registry.terraform.io/hashicorp/azurerm"). Empty if the file doesn't
+    exist or can't be parsed -- drift-checking just has nothing to compare
+    against then, rather than erroring."""
+    try:
+        with open(lock_path, "r", encoding="utf-8") as f:
+            content = f.read()
+    except OSError:
+        return {}
+    return dict(_LOCK_PROVIDER_BLOCK_RE.findall(content))
+
+
+def _scan_installed_provider_versions(cwd: str) -> dict:
+    """Provider versions actually unpacked on disk under
+    .terraform/providers/<host>/<namespace>/<name>/<version>/, keyed by the
+    same "<host>/<namespace>/<name>" address used elsewhere.
+
+    Deliberately not `terraform version -json`'s provider_selections for
+    this: that field is populated from the lock file itself, not from a
+    check of what's actually been downloaded, so comparing it against
+    .terraform.lock.hcl can never show drift -- they're the same source
+    read twice. Walking the real provider cache directory is what actually
+    answers "what version would terraform run with right now.\""""
+    providers_dir = os.path.join(cwd, ".terraform", "providers")
+    result = {}
+    if not os.path.isdir(providers_dir):
+        return result
+    for hostname in os.listdir(providers_dir):
+        host_path = os.path.join(providers_dir, hostname)
+        if not os.path.isdir(host_path):
+            continue
+        for namespace in os.listdir(host_path):
+            ns_path = os.path.join(host_path, namespace)
+            if not os.path.isdir(ns_path):
+                continue
+            for name in os.listdir(ns_path):
+                name_path = os.path.join(ns_path, name)
+                versions = [v for v in os.listdir(name_path) if os.path.isdir(os.path.join(name_path, v))] if os.path.isdir(name_path) else []
+                if not versions:
+                    continue
+                versions.sort(key=lambda v: [int(x) if x.isdigit() else 0 for x in v.split(".")], reverse=True)
+                result[f"{hostname}/{namespace}/{name}"] = versions[0]
+    return result
+
+
+def get_project_versions(project_id: str) -> dict:
+    """Terraform CLI version, the provider versions terraform currently has
+    selected for this project's initialized working directory, and any
+    drift between what's actually unpacked on disk and what
+    `.terraform.lock.hcl` pins -- which can happen if the lock file was
+    edited/regenerated (e.g. constraints bumped) without re-running init in
+    this deployment, or the .terraform folder was copied in from elsewhere."""
+    project = get_project(project_id)
+    result = {"terraform_version": get_terraform_version(), "providers": {}, "drift": []}
+    if not _is_initialized(project):
+        return result
+    cwd = os.path.join(project["project_root"], project["deployment"])
+    try:
+        terraform_exe = _resolve_executable("terraform")
+        proc = subprocess.run([terraform_exe, "version", "-json"], cwd=cwd, capture_output=True, text=True, timeout=15)
+        data = json.loads(proc.stdout)
+        result["providers"] = data.get("provider_selections", {}) or {}
+    except (RuntimeError, subprocess.SubprocessError, json.JSONDecodeError, OSError):
+        pass
+
+    installed_on_disk = _scan_installed_provider_versions(cwd)
+    locked = _parse_lock_file_versions(os.path.join(cwd, ".terraform.lock.hcl"))
+    for address, locked_version in locked.items():
+        installed_version = installed_on_disk.get(address)
+        if installed_version and installed_version != locked_version:
+            result["drift"].append({"provider": address, "installed": installed_version, "locked": locked_version})
+    return result
+
+
 _TFBACKEND_KV_RE = re.compile(r'^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"', re.MULTILINE)
 
 
@@ -1374,9 +2075,24 @@ def bootstrap():
         _enforce_retention(p["id"])
 
 
-def _run_terraform(run: Run, cwd: str, args: list[str], needs_arm_key: bool = True):
+def _run_terraform(run: Run, cwd: str, args: list[str], needs_arm_key: bool = True, on_before_close=None):
+    """`on_before_close(status)`, if given, runs BEFORE run.close(status) --
+    i.e. before the "done" SSE event reaches the browser and before
+    run_store persists this run. start_plan uses this to compute
+    run.summary/run.plan_file/run.plan_diff_cache first, so a client
+    reacting to "done" can call get_plan_diff and actually get the diff
+    immediately, instead of racing a background step that hadn't set
+    run.plan_file yet -- which silently looked like "no diff available" and
+    fell back to a lesser view instead of an error, so the race went
+    unnoticed."""
     project_id = run.target["project_id"]
     run.status = "running"
+
+    def _close(status: str):
+        if on_before_close:
+            on_before_close(status)
+        run.close(status)
+
     try:
         env = dict(os.environ)
         if needs_arm_key:
@@ -1384,14 +2100,14 @@ def _run_terraform(run: Run, cwd: str, args: list[str], needs_arm_key: bool = Tr
                 env["ARM_ACCESS_KEY"] = _get_arm_access_key(run.target)
             except Exception as e:  # noqa: BLE001 - surface any failure into the run log
                 run.append(f"ERROR fetching ARM_ACCESS_KEY: {e}")
-                run.close("failed")
+                _close("failed")
                 return
 
         try:
             terraform_exe = _resolve_executable("terraform")
         except RuntimeError as e:
             run.append(f"ERROR: {e}")
-            run.close("failed")
+            _close("failed")
             return
 
         try:
@@ -1408,7 +2124,7 @@ def _run_terraform(run: Run, cwd: str, args: list[str], needs_arm_key: bool = Tr
             )
         except FileNotFoundError:
             run.append("ERROR: terraform executable not found on PATH")
-            run.close("failed")
+            _close("failed")
             return
 
         run.proc = proc
@@ -1419,9 +2135,9 @@ def _run_terraform(run: Run, cwd: str, args: list[str], needs_arm_key: bool = Tr
         if run.cancelled:
             run.append("")
             run.append("-- cancelled by user --")
-            run.close("failed")
+            _close("failed")
         else:
-            run.close("success" if code == 0 else "failed")
+            _close("success" if code == 0 else "failed")
     finally:
         run.proc = None
         _release_active(project_id, run.id)
@@ -1588,19 +2304,18 @@ def start_plan(project_id: str, name: str, destroy: bool = False) -> Run:
     run.source_mtimes = _source_mtimes(target)
     _register_run(run)
 
-    def _do():
-        args = ["plan", f"-var-file={target['tfvars_relative']}", f"-out={plan_file}", "-no-color"]
-        if destroy:
-            args.append("-destroy")
-        _run_terraform(run, target["dir"], args)
-        # run.close() (inside _run_terraform) already persisted this run --
-        # but summary/plan_file are only known afterward, so re-persist now
-        # that they're set, or the DB copy is permanently stuck without them.
+    def _before_close(status: str):
+        # Runs BEFORE run.close()/the "done" SSE event -- so a client
+        # reacting to "done" finds run.plan_file and run.plan_diff_cache
+        # already set, instead of racing this (get_plan_diff would
+        # otherwise see plan_file still None and report "no diff
+        # available", which silently looked like a lesser view rather than
+        # the race it actually was).
+        run.status = status  # _compute_plan_diff below checks this; close() re-sets it (harmlessly) right after
         run.summary = _parse_plan_summary(run.lines)
-        run.plan_file = plan_file if run.status == "success" else None
-        run_store.save_run(run)
+        run.plan_file = plan_file if status == "success" else None
 
-        if run.status == "success":
+        if status == "success":
             try:
                 run.plan_diff_cache = _compute_plan_diff(run)
                 with open(os.path.join(run_dir, "diff.json"), "w", encoding="utf-8") as f:
@@ -1608,6 +2323,11 @@ def start_plan(project_id: str, name: str, destroy: bool = False) -> Run:
             except (ValueError, OSError):
                 pass  # get_plan_diff() will just recompute (and surface any error) on demand
 
+    def _do():
+        args = ["plan", f"-var-file={target['tfvars_relative']}", f"-out={plan_file}", "-no-color"]
+        if destroy:
+            args.append("-destroy")
+        _run_terraform(run, target["dir"], args, on_before_close=_before_close)
         _gc_run_data()  # sweep expired .tfplan files from earlier runs
 
     threading.Thread(target=_do, daemon=True).start()
@@ -1926,6 +2646,17 @@ def list_runs_summary(project_id: str | None = None, limit: int = 50, include_ch
         runs = [r for r in runs if r.target.get("project_id") == project_id]
     if not include_checks:
         runs = [r for r in runs if r.kind in PERSISTED_KINDS]
+    return [r.to_dict() for r in runs[:limit]]
+
+
+def list_recent_completions(limit: int = 20) -> list[dict]:
+    """Most recently finished init/plan/apply runs across ALL projects, for
+    the notification bell -- unlike list_runs_summary (which is always
+    scoped to whatever project you're viewing) this is cross-project by
+    design, so a run finishing in a project you're not currently looking at
+    still shows up."""
+    runs = [r for r in _runs.values() if r.kind in PERSISTED_KINDS and r.status in ("success", "failed") and r.finished_at]
+    runs.sort(key=lambda r: r.finished_at, reverse=True)
     return [r.to_dict() for r in runs[:limit]]
 
 

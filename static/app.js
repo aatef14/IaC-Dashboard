@@ -2,10 +2,13 @@
 const landingViewEl = document.getElementById("landing-view");
 const orgViewEl = document.getElementById("org-view");
 const workspaceViewEl = document.getElementById("workspace-view");
+const toolsViewEl = document.getElementById("tools-view");
+const editorViewEl = document.getElementById("editor-view");
 const btnBackEl = document.getElementById("btn-back");
 const workspaceProjectNameEl = document.getElementById("workspace-project-name");
 const workspacePillsEl = document.getElementById("workspace-pills");
 const btnOpenVscodeEl = document.getElementById("btn-open-vscode");
+const btnOpenEditorEl = document.getElementById("btn-open-editor");
 
 const orgsGridEl = document.getElementById("orgs-grid");
 const noOrgsMsgEl = document.getElementById("no-orgs-msg");
@@ -57,6 +60,20 @@ const confirmBoxEl = document.getElementById("confirm-box");
 const confirmTokenEl = document.getElementById("confirm-token");
 const confirmExpiryEl = document.getElementById("confirm-expiry");
 const confirmInputEl = document.getElementById("confirm-input");
+const btnCopyConfirmTokenEl = document.getElementById("btn-copy-confirm-token");
+
+// Copies to the clipboard only -- deliberately does NOT also fill
+// confirm-input for you. Apply is never one click by design (see README's
+// "Apply safety"); auto-filling the confirm box would silently turn
+// "copy the code" into "confirm the apply", undoing that on purpose.
+btnCopyConfirmTokenEl.onclick = async () => {
+  try {
+    await navigator.clipboard.writeText(confirmTokenEl.textContent);
+    toast("Code copied.", { type: "success", duration: 2000 });
+  } catch (e) {
+    toast("Could not copy -- select and copy the code manually.", { type: "error" });
+  }
+};
 
 let currentOrg = null; // {id, name}
 let currentProject = null; // {id, org_id, name, deployment, environment, cloud_provider, initialized}
@@ -64,6 +81,12 @@ let currentRunId = null;
 let currentEventSource = null;
 let expiryTimer = null;
 let discoveredDeployments = [];
+// Declared here (not down in the file-editor section where it's actually
+// used) because applyTheme() below reads it on every theme change,
+// including the very first one at page load -- a `let` referenced before
+// its own declaration line has executed throws (temporal dead zone), even
+// under a `typeof` guard, so it has to exist before initTheme() ever runs.
+let monacoEditorInstance = null;
 let runsPollTimer = null;
 let addProjectMode = "existing"; // "existing" | "new" -- which folder-source tab is active in Add Work Project
 
@@ -71,13 +94,19 @@ let addProjectMode = "existing"; // "existing" | "new" -- which folder-source ta
 
 // Applied to <html> as data-theme so CSS variable blocks in style.css do all
 // the work. Read from localStorage first, else follow the OS preference.
-const btnThemeEl = document.getElementById("btn-theme");
+// The toggle itself lives in the header dropdown menu (see "header menu"
+// below) rather than its own persistent button, so there's no button
+// element to keep in sync here -- its label is computed fresh each time the
+// menu opens.
 const THEME_KEY = "iac-dashboard-theme";
 
 function applyTheme(theme) {
   document.documentElement.dataset.theme = theme;
-  btnThemeEl.querySelector(".theme-icon").textContent = theme === "dark" ? "☀" : "☾";
-  btnThemeEl.dataset.tip = theme === "dark" ? "Switch to light mode" : "Switch to dark mode";
+  // Keeps an already-open editor in sync with a theme toggle instead of it
+  // staying stuck on whichever theme was active when the tab first loaded.
+  if (monacoEditorInstance && window.monaco) {
+    window.monaco.editor.setTheme(theme === "dark" ? "vs-dark" : "vs");
+  }
 }
 
 function initTheme() {
@@ -86,11 +115,11 @@ function initTheme() {
   applyTheme(saved || (prefersDark ? "dark" : "light"));
 }
 
-btnThemeEl.onclick = () => {
+function toggleTheme() {
   const next = document.documentElement.dataset.theme === "dark" ? "light" : "dark";
   localStorage.setItem(THEME_KEY, next);
   applyTheme(next);
-};
+}
 
 initTheme();
 
@@ -224,7 +253,7 @@ document.addEventListener(
 // coalesces remove+add into no change at all and nothing animates.
 function revealView(el, { back = false } = {}) {
   const cls = back ? "view-enter-back" : "view-enter";
-  for (const view of [landingViewEl, orgViewEl, workspaceViewEl]) {
+  for (const view of [landingViewEl, orgViewEl, workspaceViewEl, toolsViewEl, editorViewEl]) {
     if (view !== el) view.classList.add("hidden");
     view.classList.remove("view-enter", "view-enter-back");
   }
@@ -265,15 +294,34 @@ function fmtTime(ts) {
   return d.toLocaleString(undefined, opts);
 }
 
+// ---------- shared status-glyph icons ----------
+// Small inline SVGs (currentColor, so they pick up whatever white/ink color
+// the container already sets) instead of Unicode glyphs (✓/✗/!) -- crisper
+// at small sizes and consistent across every colored-circle-chip usage
+// (run status, toasts, error/warning cards, progress checklist).
+const ICON_CHECK =
+  '<svg viewBox="0 0 24 24" width="10" height="10" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="4,13 9,18 20,6"/></svg>';
+// A single diagonal line, not an X -- the chip's own circular background
+// already supplies the "circle" half of the universal prohibited/blocked
+// sign, so only the slash needs drawing.
+const ICON_BLOCKED =
+  '<svg viewBox="0 0 24 24" width="11" height="11" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"><line x1="5" y1="19" x2="19" y2="5"/></svg>';
+const ICON_WARNING =
+  '<svg viewBox="0 0 24 24" width="9" height="9" fill="currentColor"><rect x="10.4" y="4" width="3.2" height="10" rx="1.6"/><circle cx="12" cy="18" r="1.9"/></svg>';
+const ICON_INFO =
+  '<svg viewBox="0 0 24 24" width="9" height="9" fill="currentColor"><circle cx="12" cy="6" r="1.9"/><rect x="10.4" y="10" width="3.2" height="9" rx="1.6"/></svg>';
+
 // ---------- status rendering (tick / cross instead of a status word) ----------
 
-// success -> check, failed -> cross, queued/running -> pulsing dot. The glyph
-// lives in its own span so CSS can give it the coloured circular chip; the
-// label sits next to it and is hidden by CSS in the compact list badges.
-const STATUS_GLYPHS = { success: "✓", failed: "✗", running: "●", queued: "●" };
+// success -> check, failed -> blocked/slash, queued/running -> an actual
+// spinning ring (CSS border animation, see .status.running .status-icon --
+// no glyph content needed, the ring IS the icon). The glyph lives in its
+// own span so CSS can give it the coloured circular chip; the label sits
+// next to it and is hidden by CSS in the compact list badges.
+const STATUS_GLYPHS = { success: ICON_CHECK, failed: ICON_BLOCKED, running: "", queued: "" };
 
 function statusHtml(status) {
-  const glyph = STATUS_GLYPHS[status] || "●";
+  const glyph = status in STATUS_GLYPHS ? STATUS_GLYPHS[status] : ICON_INFO;
   return `<span class="status-icon">${glyph}</span><span class="status-label">${escapeHtml(status)}</span>`;
 }
 
@@ -363,12 +411,25 @@ confirmDialogCancelEl.onclick = () => closeModals();
 
 const toastContainerEl = document.getElementById("toast-container");
 
-const TOAST_GLYPHS = { success: "✓", error: "✗", info: "i" };
+const TOAST_GLYPHS = { success: ICON_CHECK, error: ICON_BLOCKED, warning: ICON_WARNING, info: ICON_INFO };
 
-function toast(message, { type = "info", duration = 4500 } = {}) {
+function toast(message, { type = "info", duration = 4500, action = null } = {}) {
   const el = document.createElement("div");
   el.className = `toast ${type}`;
-  el.innerHTML = `<span class="toast-icon">${TOAST_GLYPHS[type] || "i"}</span><span>${escapeHtml(message)}</span>`;
+  el.innerHTML = `<span class="toast-icon">${TOAST_GLYPHS[type] || ICON_INFO}</span><span class="toast-msg">${escapeHtml(
+    message
+  )}</span>`;
+  if (action) {
+    const btn = document.createElement("button");
+    btn.className = "toast-action";
+    btn.textContent = action.label;
+    btn.onclick = () => {
+      action.onClick();
+      el.classList.add("toast-out");
+      setTimeout(() => el.remove(), 200);
+    };
+    el.appendChild(btn);
+  }
   toastContainerEl.appendChild(el);
   setTimeout(() => {
     el.classList.add("toast-out");
@@ -376,10 +437,35 @@ function toast(message, { type = "info", duration = 4500 } = {}) {
   }, duration);
 }
 
+// ---------- breadcrumb (Home / Org / Project, or Home / Tools) ----------
+
+const breadcrumbEl = document.getElementById("breadcrumb");
+
+// segments: [{label, onClick}] -- the last segment is the current page and
+// renders as plain (non-clickable) text; every earlier one is a link.
+function renderBreadcrumb(segments) {
+  breadcrumbEl.innerHTML = segments
+    .map((seg, i) => {
+      const sep = i > 0 ? `<span class="breadcrumb-sep">/</span>` : "";
+      const isLast = i === segments.length - 1;
+      return isLast
+        ? `${sep}<span class="breadcrumb-current">${escapeHtml(seg.label)}</span>`
+        : `${sep}<button class="breadcrumb-link" data-idx="${i}">${escapeHtml(seg.label)}</button>`;
+    })
+    .join("");
+  breadcrumbEl.onclick = (ev) => {
+    const idx = ev.target.dataset.idx;
+    if (idx === undefined) return;
+    segments[Number(idx)].onClick();
+  };
+}
+
 // ---------- landing view (organizations) ----------
 
 function showLanding({ pushHistory = true } = {}) {
   revealView(landingViewEl, { back: true });
+  renderBreadcrumb([{ label: "IaC-Dashboard" }]);
+  showBgParticles();
   btnBackEl.classList.add("hidden");
   currentOrg = null;
   currentProject = null;
@@ -395,12 +481,53 @@ function showLanding({ pushHistory = true } = {}) {
 }
 
 btnBackEl.onclick = () => {
+  if (!editorViewEl.classList.contains("hidden")) {
+    closeFileEditor();
+    return;
+  }
+  if (!toolsViewEl.classList.contains("hidden")) {
+    // Tools isn't nested under any org/project, so there's no single
+    // "parent" view to compute from currentOrg/currentProject the way the
+    // other two branches do -- go back to wherever you actually were
+    // (landing, an org, or a specific project workspace) before opening
+    // Tools, instead of always resetting to the landing page.
+    const returnTo = preToolsPath || "/";
+    preToolsPath = null;
+    history.pushState({}, "", returnTo);
+    restoreFromLocation({ pushHistory: false });
+    return;
+  }
   if (!workspaceViewEl.classList.contains("hidden") && currentOrg) {
     showOrgView(currentOrg);
   } else {
     showLanding();
   }
 };
+
+// ---------- tools view (standalone utilities, not tied to a project) ----------
+
+let preToolsPath = null; // wherever we were before opening Tools -- see btnBackEl.onclick above
+
+function showToolsView({ pushHistory = true } = {}) {
+  if (pushHistory && location.pathname !== "/tools") {
+    preToolsPath = location.pathname + location.search;
+  }
+  revealView(toolsViewEl);
+  hideBgParticles();
+  renderBreadcrumb([{ label: "IaC-Dashboard", onClick: showLanding }, { label: "Tools" }]);
+  btnBackEl.classList.remove("hidden");
+  btnBackEl.textContent = "←";
+  currentOrg = null;
+  currentProject = null;
+  currentRunId = null;
+  if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
+  if (runsPollTimer) { clearInterval(runsPollTimer); runsPollTimer = null; }
+  document.title = "Tools — IaC-Dashboard";
+
+  if (pushHistory && location.pathname !== "/tools") {
+    history.pushState({}, "", "/tools");
+  }
+}
 
 // ---------- org view (work projects inside one organization) ----------
 
@@ -415,8 +542,10 @@ async function showOrgView(org, { pushHistory = true } = {}) {
   // Has to be read BEFORE revealView, which hides the other views.
   const cameFromWorkspace = !workspaceViewEl.classList.contains("hidden");
   revealView(orgViewEl, { back: cameFromWorkspace });
+  hideBgParticles();
+  renderBreadcrumb([{ label: "IaC-Dashboard", onClick: showLanding }, { label: org.name }]);
   btnBackEl.classList.remove("hidden");
-  btnBackEl.textContent = "← Organizations";
+  btnBackEl.textContent = "←";
   orgViewNameEl.textContent = org.name;
   document.title = `${org.name} — IaC-Dashboard`;
 
@@ -432,6 +561,33 @@ async function showOrgView(org, { pushHistory = true } = {}) {
 window.addEventListener("popstate", () => restoreFromLocation({ pushHistory: false }));
 
 async function restoreFromLocation({ pushHistory }) {
+  if (location.pathname === "/tools") {
+    showToolsView({ pushHistory });
+    return;
+  }
+  // The editor opens in its own tab (a fresh load of this same app, at a
+  // /editor/<org>/<project> URL) rather than swapping the view in place --
+  // resolve org+project from the URL the same way the plain
+  // /<org>/<project> workspace route does below, just one level deeper.
+  const editorMatch = location.pathname.match(/^\/editor\/([^/]+)\/([^/]+)\/?$/);
+  if (editorMatch) {
+    const orgName = decodeURIComponent(editorMatch[1]);
+    const projectName = decodeURIComponent(editorMatch[2]);
+    try {
+      const orgs = await api("/api/organizations");
+      const org = orgs.find((o) => o.name === orgName);
+      if (!org) throw new Error(`no organization named "${orgName}"`);
+      const projects = await api(`/api/projects?org_id=${org.id}`);
+      const project = projects.find((p) => p.name === projectName);
+      if (!project) throw new Error(`no project named "${projectName}" in "${orgName}"`);
+      currentOrg = org;
+      await showFileEditor(project, { pushHistory });
+    } catch (e) {
+      toast(`That link is no longer valid: ${e.message}`, { type: "error" });
+      showLanding({ pushHistory });
+    }
+    return;
+  }
   const match = location.pathname.match(/^\/([^/]+)(?:\/([^/]+))?\/?$/);
   if (!match) {
     showLanding({ pushHistory });
@@ -465,13 +621,274 @@ function closeAllCardMenus() {
 }
 document.addEventListener("click", closeAllCardMenus);
 
+// ---------- mouse-tracking spotlight on cards ----------
+// One delegated listener rather than one per card (cards get re-created on
+// every refresh) -- sets --mx/--my to the cursor position relative to
+// whichever card it's currently over; the gradient itself is pure CSS
+// (see .project-card::after).
+document.addEventListener("mousemove", (ev) => {
+  const card = ev.target.closest(".project-card");
+  if (!card) return;
+  const rect = card.getBoundingClientRect();
+  card.style.setProperty("--mx", `${ev.clientX - rect.left}px`);
+  card.style.setProperty("--my", `${ev.clientY - rect.top}px`);
+});
+
+// ---------- interactive background particles (landing page) ----------
+// A swarm of small dots that orbits around the cursor and trails it as it
+// moves -- each dot keeps a fixed angle/radius offset from the cursor (plus a
+// slow independent drift so the swarm keeps breathing when the cursor is
+// still) and eases toward that point at its own speed, so the cloud lags
+// and re-forms around the cursor rather than reacting only when close.
+// Shown/hidden by showLanding()/the other view functions, animated only
+// while visible so it doesn't burn CPU on views where it isn't shown.
+
+const bgParticlesEl = document.getElementById("bg-particles");
+const PARTICLE_COLORS = ["#3b82f6", "#d97706", "#8b5cf6", "#ef4444"]; // blue, amber, purple, red -- same accent + semantic hues used elsewhere, not a new palette
+
+let bgParticles = [];
+let bgParticlesRafId = null;
+let mouseX = null;
+let mouseY = null;
+
+document.addEventListener("mousemove", (ev) => {
+  mouseX = ev.clientX;
+  mouseY = ev.clientY;
+});
+
+// window.innerWidth/innerHeight are 0 in some embedded/preview contexts
+// before layout settles -- document.documentElement.clientWidth/Height is a
+// more reliable fallback, and a fixed default covers the (rare) case where
+// even that reports 0, so particles never all end up stacked at (0,0).
+function getViewportSize() {
+  return {
+    w: window.innerWidth || document.documentElement.clientWidth || 1200,
+    h: window.innerHeight || document.documentElement.clientHeight || 800,
+  };
+}
+
+function initBgParticles(count = 46) {
+  bgParticlesEl.innerHTML = "";
+  bgParticles = [];
+  const { w, h } = getViewportSize();
+  if (mouseX === null) {
+    mouseX = w / 2;
+    mouseY = h / 2;
+  }
+  for (let i = 0; i < count; i++) {
+    const el = document.createElement("div");
+    el.className = "bg-dot";
+    const size = 2 + Math.random() * 4;
+    el.style.width = `${size}px`;
+    el.style.height = `${size}px`;
+    el.style.background = PARTICLE_COLORS[i % PARTICLE_COLORS.length];
+    el.style.opacity = String(0.3 + Math.random() * 0.35);
+    bgParticlesEl.appendChild(el);
+    bgParticles.push({
+      el,
+      angle: Math.random() * Math.PI * 2,
+      radius: 40 + Math.random() * 150,
+      angleSpeed: (Math.random() < 0.5 ? -1 : 1) * (0.004 + Math.random() * 0.012),
+      ease: 0.04 + Math.random() * 0.09,
+      x: mouseX,
+      y: mouseY,
+    });
+  }
+}
+
+function animateBgParticles() {
+  for (const p of bgParticles) {
+    p.angle += p.angleSpeed;
+    const targetX = mouseX + Math.cos(p.angle) * p.radius;
+    const targetY = mouseY + Math.sin(p.angle) * p.radius;
+    p.x += (targetX - p.x) * p.ease;
+    p.y += (targetY - p.y) * p.ease;
+    p.el.style.transform = `translate3d(${p.x}px, ${p.y}px, 0)`;
+  }
+  bgParticlesRafId = requestAnimationFrame(animateBgParticles);
+}
+
+function showBgParticles() {
+  if (bgParticles.length === 0) initBgParticles();
+  bgParticlesEl.classList.add("visible");
+  if (!bgParticlesRafId) animateBgParticles();
+}
+
+function hideBgParticles() {
+  bgParticlesEl.classList.remove("visible");
+  if (bgParticlesRafId) {
+    cancelAnimationFrame(bgParticlesRafId);
+    bgParticlesRafId = null;
+  }
+}
+
+// Re-scatter across the new viewport size on resize -- otherwise a shrink
+// leaves dots stranded off-screen to the right/bottom, and a grow leaves
+// the new space empty. Debounced since resize fires continuously while
+// dragging; only bothers regenerating if particles have actually been
+// created (no-op on any view where the background isn't shown).
+let bgParticlesResizeTimer = null;
+window.addEventListener("resize", () => {
+  clearTimeout(bgParticlesResizeTimer);
+  bgParticlesResizeTimer = setTimeout(() => {
+    if (bgParticles.length > 0) initBgParticles();
+  }, 300);
+});
+
+// ---------- header dropdown menu (theme / Tools / Restart Server) ----------
+// Same ⋮-menu pattern as a project/org card, just anchored under the header
+// button instead -- one menu instead of three separate always-visible
+// buttons cluttering the header.
+
+const btnHeaderMenuEl = document.getElementById("btn-header-menu");
+
+btnHeaderMenuEl.onclick = (ev) => {
+  ev.stopPropagation();
+  const alreadyOpen = btnHeaderMenuEl.classList.contains("menu-open");
+  closeAllCardMenus();
+  if (alreadyOpen) return;
+
+  btnHeaderMenuEl.classList.add("menu-open");
+  const isDark = document.documentElement.dataset.theme === "dark";
+  const menu = document.createElement("div");
+  menu.className = "card-menu header-menu";
+  menu.innerHTML = `
+    <button data-action="theme">${isDark ? "☀ Switch to light mode" : "☾ Switch to dark mode"}</button>
+    <button data-action="tools">Tools</button>
+    <button data-action="restart" class="danger">Restart Server</button>
+  `;
+  menu.onclick = (mev) => {
+    mev.stopPropagation();
+    const action = mev.target.dataset.action;
+    if (!action) return;
+    closeAllCardMenus();
+    if (action === "theme") toggleTheme();
+    else if (action === "tools") showToolsView();
+    else if (action === "restart") restartServer();
+  };
+  btnHeaderMenuEl.parentElement.appendChild(menu);
+};
+
+// ---------- notification bell (cross-project run completions) ----------
+// Polls for runs that finished anywhere, not just the project currently
+// open -- Azure-portal-style bell with an unread badge, dropdown history,
+// and a toast (with a "View" jump straight to the run) for anything that
+// finishes while you're looking at something else.
+
+const btnNotifBellEl = document.getElementById("btn-notif-bell");
+const notifBadgeEl = document.getElementById("notif-badge");
+const notifDropdownEl = document.getElementById("notif-dropdown");
+
+let notifLastSeenAt = Date.now() / 1000; // don't toast for runs that finished before the page loaded
+let notifUnreadCount = 0;
+let notifItems = [];
+
+function renderNotifBadge() {
+  notifBadgeEl.textContent = String(notifUnreadCount);
+  notifBadgeEl.classList.toggle("hidden", notifUnreadCount === 0);
+}
+
+function notifItemHtml(run) {
+  const icon = run.status === "success" ? ICON_CHECK : ICON_BLOCKED;
+  return `
+    <button class="notif-item ${run.status}" data-run-id="${run.run_id}">
+      <span class="notif-item-icon">${icon}</span>
+      <span class="notif-item-body">
+        <span class="notif-item-title">${escapeHtml(run.target.project_name)} &middot; ${escapeHtml(run.kind)}</span>
+        <span class="notif-item-time">${escapeHtml(fmtRelative(run.finished_at))}</span>
+      </span>
+    </button>`;
+}
+
+function renderNotifDropdown() {
+  notifDropdownEl.innerHTML = notifItems.length
+    ? notifItems.map(notifItemHtml).join("")
+    : `<div class="notif-empty">No runs finished yet this session.</div>`;
+  notifDropdownEl.querySelectorAll(".notif-item").forEach((btn) => {
+    btn.onclick = () => {
+      const run = notifItems.find((r) => r.run_id === btn.dataset.runId);
+      notifDropdownEl.classList.add("hidden");
+      if (run) navigateToRun(run);
+    };
+  });
+}
+
+btnNotifBellEl.onclick = (ev) => {
+  ev.stopPropagation();
+  const opening = notifDropdownEl.classList.contains("hidden");
+  notifDropdownEl.classList.toggle("hidden", !opening);
+  if (opening) {
+    renderNotifDropdown();
+    notifUnreadCount = 0;
+    renderNotifBadge();
+  }
+};
+document.addEventListener("click", (ev) => {
+  if (!notifDropdownEl.classList.contains("hidden") && !notifDropdownEl.contains(ev.target) && ev.target !== btnNotifBellEl) {
+    notifDropdownEl.classList.add("hidden");
+  }
+});
+
+// Jumps to the run's project/workspace from anywhere -- the notification
+// may point at a project in a different organization than the one (if any)
+// currently open, so this re-resolves both from scratch rather than
+// assuming currentOrg already matches.
+async function navigateToRun(run) {
+  const projectId = run.target.project_id;
+  let project;
+  let orgs;
+  try {
+    [project, orgs] = await Promise.all([api(`/api/projects/${projectId}`), api("/api/organizations")]);
+  } catch (e) {
+    toast("That project no longer exists.", { type: "error" });
+    return;
+  }
+  const org = orgs.find((o) => o.id === project.org_id);
+  if (!org) {
+    toast("That project's organization no longer exists.", { type: "error" });
+    return;
+  }
+  currentOrg = org;
+  await openWorkspace(project);
+  selectRun(run.run_id);
+}
+
+async function pollNotifications() {
+  let recent;
+  try {
+    recent = await api("/api/notifications/recent");
+  } catch (e) {
+    return;
+  }
+  notifItems = recent;
+
+  const fresh = recent.filter((r) => r.finished_at && r.finished_at > notifLastSeenAt);
+  for (const run of fresh) {
+    // Already looking at this exact run live -- it just finished in front
+    // of the user, no need to also toast about it.
+    if (run.run_id === currentRunId) continue;
+    notifUnreadCount++;
+    toast(`${run.target.project_name}: ${run.kind} ${run.status === "success" ? "succeeded" : "failed"}`, {
+      type: run.status === "success" ? "success" : "error",
+      duration: 10000,
+      action: { label: "View", onClick: () => navigateToRun(run) },
+    });
+  }
+  if (recent.length) {
+    notifLastSeenAt = Math.max(notifLastSeenAt, ...recent.map((r) => r.finished_at || 0));
+  }
+  renderNotifBadge();
+}
+setInterval(pollNotifications, 8000);
+pollNotifications();
+
 function renderOrgCard(o) {
   const card = document.createElement("div");
   card.className = "project-card";
   card.innerHTML = `
     <div class="card-top-row">
       <div class="name">${o.name}</div>
-      <button class="card-menu-btn" data-tip="Organization settings">&#8942;</button>
+      <button class="card-menu-btn" data-tip="Organization settings" aria-label="Organization settings">&#8942;</button>
     </div>
     <div class="path">${o.project_count} work project${o.project_count === 1 ? "" : "s"}</div>
   `;
@@ -507,11 +924,84 @@ function renderOrgCard(o) {
   return card;
 }
 
+const orgSearchInputEl = document.getElementById("org-search-input");
+let allOrgs = [];
+
 async function refreshOrgs() {
-  const orgs = await api("/api/organizations");
+  allOrgs = await api("/api/organizations");
+  renderFilteredOrgs();
+}
+
+function renderFilteredOrgs() {
+  const q = orgSearchInputEl.value.trim().toLowerCase();
+  const filtered = q ? allOrgs.filter((o) => o.name.toLowerCase().includes(q)) : allOrgs;
   orgsGridEl.innerHTML = "";
-  noOrgsMsgEl.classList.toggle("hidden", orgs.length > 0);
-  for (const o of orgs) orgsGridEl.appendChild(renderOrgCard(o));
+  for (const o of filtered) orgsGridEl.appendChild(renderOrgCard(o));
+
+  if (allOrgs.length === 0) {
+    noOrgsMsgEl.textContent = 'No organizations yet — click "New Organization" to create one. Projects live inside an organization, so this comes first.';
+    noOrgsMsgEl.classList.remove("hidden");
+  } else if (filtered.length === 0) {
+    noOrgsMsgEl.textContent = `No organizations match "${orgSearchInputEl.value.trim()}".`;
+    noOrgsMsgEl.classList.remove("hidden");
+  } else {
+    noOrgsMsgEl.classList.add("hidden");
+  }
+}
+orgSearchInputEl.addEventListener("input", renderFilteredOrgs);
+
+// "2h ago" style -- for the last-run badge, where the exact timestamp
+// matters less than "was this recent or ages ago".
+function fmtRelative(ts) {
+  const seconds = Math.max(0, Date.now() / 1000 - ts);
+  if (seconds < 60) return "just now";
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  return fmtTime(ts);
+}
+
+function lastRunBadgeHtml(lastRun) {
+  if (!lastRun) return `<div class="last-run-badge muted">no runs yet</div>`;
+  const icon = lastRun.status === "success" ? ICON_CHECK : lastRun.status === "failed" ? ICON_BLOCKED : "";
+  return `<div class="last-run-badge ${lastRun.status}">
+    <span class="last-run-icon">${icon}</span>
+    <span>${escapeHtml(lastRun.kind.toUpperCase())} ${escapeHtml(fmtRelative(lastRun.created_at))}</span>
+  </div>`;
+}
+
+// Fires after project cards render, one /versions call per initialized
+// project. Silent when there's no drift (the common case, right after a
+// clean init) -- the badge only appears when there's actually something to
+// look at, same "don't show it unless it matters" approach as last-run.
+async function checkProviderDrift(projects) {
+  await Promise.all(
+    projects
+      .filter((p) => p.initialized)
+      .map(async (p) => {
+        let data;
+        try {
+          data = await api(`/api/projects/${p.id}/versions`);
+        } catch (e) {
+          return;
+        }
+        const drift = data.drift || [];
+        if (drift.length === 0) return;
+        const badge = document.querySelector(`.provider-drift-badge[data-project-id="${p.id}"]`);
+        if (!badge) return;
+        const tip = drift
+          .map((d) => `${d.provider}\n  installed: ${d.installed}\n  locked: ${d.locked}`)
+          .join("\n\n");
+        badge.classList.remove("hidden");
+        badge.dataset.tip = `Installed provider version differs from .terraform.lock.hcl -- re-run init to reconcile.\n\n${tip}`;
+        badge.innerHTML = `<span class="drift-icon">${ICON_WARNING}</span><span>${drift.length} provider${
+          drift.length === 1 ? "" : "s"
+        } out of sync with lock file</span>`;
+      })
+  );
 }
 
 function renderProjectCard(p) {
@@ -520,7 +1010,7 @@ function renderProjectCard(p) {
   card.innerHTML = `
     <div class="card-top-row">
       <div class="name">${p.name}</div>
-      <button class="card-menu-btn" data-tip="Project settings">&#8942;</button>
+      <button class="card-menu-btn" data-tip="Project settings" aria-label="Project settings">&#8942;</button>
     </div>
     <div class="pills">
       <span class="pill" data-tip="${escapeHtml(
@@ -544,6 +1034,8 @@ function renderProjectCard(p) {
     <div class="init-status ${p.initialized ? "ok" : "pending"}">
       ${p.initialized ? "initialized" : "not initialized yet this session"}
     </div>
+    ${lastRunBadgeHtml(p.last_run)}
+    <div class="provider-drift-badge hidden" data-project-id="${p.id}"></div>
   `;
 
   const menuBtn = card.querySelector(".card-menu-btn");
@@ -599,13 +1091,33 @@ function renderProjectCard(p) {
   return card;
 }
 
+const projectSearchInputEl = document.getElementById("project-search-input");
+let allProjects = [];
+
 async function refreshProjects() {
   if (!currentOrg) return;
-  const projects = await api(`/api/projects?org_id=${currentOrg.id}`);
-  projectsGridEl.innerHTML = "";
-  noProjectsMsgEl.classList.toggle("hidden", projects.length > 0);
-  for (const p of projects) projectsGridEl.appendChild(renderProjectCard(p));
+  allProjects = await api(`/api/projects?org_id=${currentOrg.id}`);
+  renderFilteredProjects();
 }
+
+function renderFilteredProjects() {
+  const q = projectSearchInputEl.value.trim().toLowerCase();
+  const filtered = q ? allProjects.filter((p) => p.name.toLowerCase().includes(q)) : allProjects;
+  projectsGridEl.innerHTML = "";
+  for (const p of filtered) projectsGridEl.appendChild(renderProjectCard(p));
+  checkProviderDrift(filtered);
+
+  if (allProjects.length === 0) {
+    noProjectsMsgEl.textContent = 'No work projects yet in this organization — click "Add Work Project" to set one up.';
+    noProjectsMsgEl.classList.remove("hidden");
+  } else if (filtered.length === 0) {
+    noProjectsMsgEl.textContent = `No work projects match "${projectSearchInputEl.value.trim()}".`;
+    noProjectsMsgEl.classList.remove("hidden");
+  } else {
+    noProjectsMsgEl.classList.add("hidden");
+  }
+}
+projectSearchInputEl.addEventListener("input", renderFilteredProjects);
 
 // ---------- add organization modal ----------
 
@@ -841,8 +1353,14 @@ btnCreateProjectEl.onclick = async () => {
 async function openWorkspace(project, { pushHistory = true } = {}) {
   currentProject = project;
   revealView(workspaceViewEl);
+  hideBgParticles();
+  renderBreadcrumb([
+    { label: "IaC-Dashboard", onClick: showLanding },
+    { label: currentOrg.name, onClick: () => showOrgView(currentOrg) },
+    { label: project.name },
+  ]);
   btnBackEl.classList.remove("hidden");
-  btnBackEl.textContent = "← Projects";
+  btnBackEl.textContent = "←";
   renderTargetPills(project);
   resetLogView();
   runTitleEl.textContent = "No run selected";
@@ -882,11 +1400,44 @@ function renderTargetPills(project) {
   workspacePillsEl.innerHTML = `
     <span class="pill" data-tip="${escapeHtml(deploymentTip)}">${escapeHtml(project.deployment)}</span>
     <span class="pill" data-tip="${escapeHtml(envTip)}">${escapeHtml(project.environment)}</span>
-    <span class="pill checking" id="auth-pill">checking Azure&hellip;</span>`;
+    <span class="pill checking" id="auth-pill">checking Azure&hellip;</span>
+    <span class="pill muted-pill" id="terraform-version-pill" data-tip="Terraform CLI version on this machine">tf …</span>`;
   btnPlanEl.disabled = !project.initialized;
   btnPlanDestroyEl.disabled = !project.initialized;
   btnValidateEl.disabled = !project.initialized;
   refreshAuthPill(project.id);
+  refreshTerraformVersionPill(project.id);
+}
+
+async function refreshTerraformVersionPill(projectId) {
+  const pillEl = document.getElementById("terraform-version-pill");
+  if (!pillEl) return;
+  let terraformVersion = "unknown";
+  let providers = {};
+  try {
+    const data = await api(`/api/projects/${projectId}/versions`);
+    terraformVersion = data.terraform_version || "unknown";
+    providers = data.providers || {};
+  } catch (e) {
+    // leave defaults -- pill still renders, just without version info
+  }
+  const providerNames = Object.keys(providers);
+  // the workspace may have been left (or switched) while that request was in flight
+  const stillCurrent = document.getElementById("terraform-version-pill");
+  if (!stillCurrent) return;
+  stillCurrent.textContent = providerNames.length
+    ? `tf ${terraformVersion} · ${providerNames.length} provider${providerNames.length === 1 ? "" : "s"}`
+    : `tf ${terraformVersion}`;
+  const tipLines = [`Terraform CLI: ${terraformVersion}`];
+  if (providerNames.length) {
+    tipLines.push("", "Providers:");
+    for (const name of providerNames) {
+      tipLines.push(`  ${name}: ${providers[name] || "unknown"}`);
+    }
+  } else {
+    tipLines.push("", "Providers: run terraform init to see selected provider versions");
+  }
+  stillCurrent.setAttribute("data-tip", tipLines.join("\n"));
 }
 
 // The pill used to claim "real Azure changes" unconditionally, which was a
@@ -913,6 +1464,15 @@ async function refreshAuthPill(projectId) {
   pill.dataset.tip = lines.join("\n");
   pill.dataset.tipError = String(!result.authenticated);
 }
+
+// `az` state (login, expired token, subscription switch) can change in
+// another window while the dashboard tab just sits open -- re-check
+// whenever the tab regains focus, not only when Re-run Init is clicked.
+window.addEventListener("focus", () => {
+  if (currentProject && document.getElementById("auth-pill")) {
+    refreshAuthPill(currentProject.id);
+  }
+});
 
 async function refreshCurrentProjectInitState() {
   const fresh = await api(`/api/projects/${currentProject.id}`);
@@ -1040,10 +1600,20 @@ const progressListEl = document.getElementById("progress-list");
 const progressCountsEl = document.getElementById("progress-counts");
 const btnToggleProgressLogEl = document.getElementById("btn-toggle-progress-log");
 
+// Used both for HTML text content AND interpolated into attribute values
+// (data-tip="...", data-address="...", etc) throughout this file -- the
+// DOM textContent/innerHTML round-trip below only escapes &, <, > (which is
+// all a text NODE needs), not quotes, so a value containing a literal "
+// would silently close an attribute early and truncate everything after it.
+// That's a real bug this hit: terraform resource addresses using for_each
+// (e.g. `azurerm_storage_account.this["st-1"]`) always contain a literal ",
+// so the state-resource-browser's data-address attribute got cut off right
+// before it, and every for_each-keyed resource's detail lookup failed with
+// a truncated address.
 function escapeHtml(s) {
   const div = document.createElement("div");
   div.textContent = s;
-  return div.innerHTML;
+  return div.innerHTML.replaceAll('"', "&quot;").replaceAll("'", "&#39;");
 }
 
 function formatAttrValue(v) {
@@ -1052,24 +1622,54 @@ function formatAttrValue(v) {
   return String(v);
 }
 
+// Highlights just the substring that differs between a changed attribute's
+// before/after values (e.g. "Standard_LRS" -> "Standard_GRS" highlights only
+// "L"/"G"), rather than the whole value -- found via longest common
+// prefix/suffix, which is cheap and reads naturally for the
+// mostly-one-token-changed values terraform attributes tend to have. Returns
+// pre-escaped HTML strings, safe to insert directly.
+function highlightDiffPair(beforeStr, afterStr) {
+  let p = 0;
+  const maxP = Math.min(beforeStr.length, afterStr.length);
+  while (p < maxP && beforeStr[p] === afterStr[p]) p++;
+  let s = 0;
+  const maxS = maxP - p;
+  while (s < maxS && beforeStr[beforeStr.length - 1 - s] === afterStr[afterStr.length - 1 - s]) s++;
+
+  const beforeMid = beforeStr.slice(p, beforeStr.length - s);
+  const afterMid = afterStr.slice(p, afterStr.length - s);
+
+  const beforeHtml =
+    escapeHtml(beforeStr.slice(0, p)) +
+    (beforeMid ? `<mark class="diff-hl diff-hl-old">${escapeHtml(beforeMid)}</mark>` : "") +
+    escapeHtml(beforeStr.slice(beforeStr.length - s));
+  const afterHtml =
+    escapeHtml(afterStr.slice(0, p)) +
+    (afterMid ? `<mark class="diff-hl diff-hl-new">${escapeHtml(afterMid)}</mark>` : "") +
+    escapeHtml(afterStr.slice(afterStr.length - s));
+
+  return { beforeHtml, afterHtml };
+}
+
 function buildDetailRows(rc) {
   const unknown = new Set(rc.unknown_after_apply || []);
   const rows = [];
   if (rc.action === "create") {
     for (const [k, v] of Object.entries(rc.after || {})) {
-      if (unknown.has(k)) rows.push([k, "(known after apply)"]);
-      else if (v !== null) rows.push([k, formatAttrValue(v)]);
+      if (unknown.has(k)) rows.push([k, escapeHtml("(known after apply)")]);
+      else if (v !== null) rows.push([k, escapeHtml(formatAttrValue(v))]);
     }
   } else if (rc.action === "delete") {
     for (const [k, v] of Object.entries(rc.before || {})) {
-      if (v !== null) rows.push([k, formatAttrValue(v)]);
+      if (v !== null) rows.push([k, escapeHtml(formatAttrValue(v))]);
     }
   } else {
     // update / replace -- only the fields that actually changed
     for (const k of rc.changed_fields) {
       const beforeVal = unknown.has(k) ? "(known after apply)" : formatAttrValue((rc.before || {})[k]);
       const afterVal = unknown.has(k) ? "(known after apply)" : formatAttrValue((rc.after || {})[k]);
-      rows.push([k, `${beforeVal}  →  ${afterVal}`]);
+      const { beforeHtml, afterHtml } = highlightDiffPair(beforeVal, afterVal);
+      rows.push([k, `${beforeHtml}  →  ${afterHtml}`]);
     }
   }
   return rows;
@@ -1088,8 +1688,20 @@ function buildDetailRows(rc) {
 // monochrome log text. Falls back to plain text for anything that doesn't
 // match this shape, so unrelated log content is never mangled.
 const DIAG_RE = /^(Error|Warning): (.+)$/;
+// When the error is inside a module call, terraform prefixes the location
+// with an extra "  with module.foo[\"bar\"].some_resource.this," line before
+// "on file line N" -- without consuming it, that line (and everything after
+// it, since the location match then fails) fell through into plain detail
+// text instead of getting the location/code styling.
+const DIAG_WITH_RE = /^\s{2}with (.+),$/;
 const DIAG_LOCATION_RE = /^\s{2}on (.+?) line (\d+)(?:, in (.+))?:$/;
 const DIAG_CODE_RE = /^\s*(\d+):\s?(.*)$/;
+// "Changes to Outputs:" is terraform's own mini-diff of output values
+// (~ changed / + added / - removed, HCL-shaped, arbitrarily nested) --
+// same idea as the diagnostic cards: color it like the symbols mean,
+// instead of leaving it as a plain wall of text sitting right above them.
+const OUTPUTS_HEADER_RE = /^Changes to Outputs:$/;
+const OUTPUTS_LINE_RE = /^(\s*)([~+-])(.*)$/;
 
 function parseLogBlocks(lines) {
   const blocks = [];
@@ -1101,6 +1713,17 @@ function parseLogBlocks(lines) {
 
   let i = 0;
   while (i < lines.length) {
+    if (OUTPUTS_HEADER_RE.test(lines[i])) {
+      flushText();
+      i++;
+      const outputLines = [];
+      while (i < lines.length && lines[i] !== "") {
+        outputLines.push(lines[i]);
+        i++;
+      }
+      blocks.push({ type: "outputs", lines: outputLines });
+      continue;
+    }
     const diagMatch = DIAG_RE.exec(lines[i]);
     if (!diagMatch) {
       textBuf.push(lines[i]);
@@ -1113,10 +1736,21 @@ function parseLogBlocks(lines) {
     i++;
     if (lines[i] === "") i++;
 
+    // "with ..." always precedes "on file line N" when present, but only
+    // actually consume it once we've confirmed the location line follows --
+    // otherwise leave `i` untouched so it falls through to detail text
+    // like any other unrecognized line, instead of silently vanishing.
+    let withContext = null;
+    const withMatch = i < lines.length ? DIAG_WITH_RE.exec(lines[i]) : null;
+    const locMatch = i + (withMatch ? 1 : 0) < lines.length ? DIAG_LOCATION_RE.exec(lines[i + (withMatch ? 1 : 0)]) : null;
+
     let location = null;
-    const locMatch = i < lines.length ? DIAG_LOCATION_RE.exec(lines[i]) : null;
     if (locMatch) {
-      location = { file: locMatch[1], line: locMatch[2], block: locMatch[3] || null };
+      if (withMatch) {
+        withContext = withMatch[1];
+        i++;
+      }
+      location = { file: locMatch[1], line: locMatch[2], block: locMatch[3] || null, withContext };
       i++;
     }
 
@@ -1144,12 +1778,28 @@ function renderDiagCodeLine(line) {
   return `<span class="diag-code-line"><span class="diag-code-lineno">${escapeHtml(m[1])}</span><span class="diag-code-src">${escapeHtml(m[2])}</span></span>`;
 }
 
+function renderOutputsLineHtml(line) {
+  const m = OUTPUTS_LINE_RE.exec(line);
+  if (!m) return `<span class="outputs-line">${escapeHtml(line)}</span>`;
+  const [, indent, symbol, rest] = m;
+  const kind = symbol === "~" ? "update" : symbol === "+" ? "create" : "delete";
+  return `<span class="outputs-line ${kind}">${escapeHtml(indent)}<span class="outputs-symbol">${symbol}</span>${escapeHtml(rest)}</span>`;
+}
+
 function renderLogBlockHtml(block) {
   if (block.type === "text") {
     return `<span class="log-text">${escapeHtml(block.lines.join("\n"))}</span>`;
   }
+  if (block.type === "outputs") {
+    return `<div class="outputs-block"><div class="outputs-head">Changes to Outputs</div><div class="outputs-body">${block.lines
+      .map(renderOutputsLineHtml)
+      .join("\n")}</div></div>`;
+  }
+  const withHtml = block.location && block.location.withContext
+    ? `<div class="diag-location">with <span class="diag-file">${escapeHtml(block.location.withContext)}</span></div>`
+    : "";
   const locationHtml = block.location
-    ? `<div class="diag-location">on <span class="diag-file">${escapeHtml(block.location.file)}</span> line ${escapeHtml(
+    ? `${withHtml}<div class="diag-location">on <span class="diag-file">${escapeHtml(block.location.file)}</span> line ${escapeHtml(
         block.location.line
       )}${block.location.block ? `, in ${escapeHtml(block.location.block)}` : ""}</div>`
     : "";
@@ -1158,7 +1808,7 @@ function renderLogBlockHtml(block) {
     : "";
   const detailHtml = block.detail.length ? `<div class="diag-detail">${escapeHtml(block.detail.join("\n"))}</div>` : "";
   return `<div class="diag-block ${block.level}">
-    <div class="diag-head"><span class="diag-icon">${block.level === "error" ? "&#10007;" : "&#33;"}</span><span class="diag-title">${escapeHtml(
+    <div class="diag-head"><span class="diag-icon">${block.level === "error" ? ICON_BLOCKED : ICON_WARNING}</span><span class="diag-title">${escapeHtml(
     block.summary
   )}</span></div>
     ${locationHtml}${codeHtml}${detailHtml}
@@ -1202,14 +1852,51 @@ function setDetailView(mode) {
   progressListEl.classList.toggle("hidden", mode !== "progress");
 }
 
+function setDiffRowExpanded(tr, detailTr, expand) {
+  detailTr.classList.toggle("expanded", expand);
+  tr.querySelector(".expand-caret").innerHTML = expand ? "&#9662;" : "&#9656;";
+}
+
+const btnToggleAllDiffEl = document.getElementById("btn-toggle-all-diff");
+btnToggleAllDiffEl.onclick = () => {
+  const expand = btnToggleAllDiffEl.textContent === "Expand all";
+  for (const tr of planDiffTableBodyEl.querySelectorAll(".diff-row")) {
+    setDiffRowExpanded(tr, tr.nextElementSibling, expand);
+  }
+  btnToggleAllDiffEl.textContent = expand ? "Collapse all" : "Expand all";
+};
+
+const diffFilterInputEl = document.getElementById("diff-filter-input");
+
+function applyDiffFilter() {
+  const q = diffFilterInputEl.value.trim().toLowerCase();
+  for (const tr of planDiffTableBodyEl.querySelectorAll(".diff-row")) {
+    const matches = !q || tr.querySelector(".resource-address").textContent.toLowerCase().includes(q);
+    tr.classList.toggle("hidden", !matches);
+    // keep the detail row's filtered-hidden state in lockstep with its
+    // parent's -- previously this only ever ADDED hidden (on a non-match)
+    // and never removed it again once the filter no longer excluded the
+    // row, leaving it stuck hidden even after typing a matching query again
+    tr.nextElementSibling.classList.toggle("hidden", !matches);
+  }
+}
+diffFilterInputEl.addEventListener("input", applyDiffFilter);
+
+// Deliberately does NOT touch setDetailView itself -- it used to switch to
+// "log" immediately and only to "diff" after the plan-diff fetch resolved,
+// which meant every click on a finished plan run flashed the raw log for a
+// moment before the table swapped in. The caller now owns the "what do we
+// show while this is loading" decision and only asks for "diff" once it's
+// actually ready.
 async function showPlanDiff(run) {
-  setDetailView("log");
   if (run.kind !== "plan" || run.status !== "success") return false;
 
   try {
     const diff = await api(`/api/runs/${run.run_id}/plan-diff`);
     if (diff.total === 0) return false; // "No changes" -- raw log already says so, nothing to tabulate
 
+    diffFilterInputEl.value = "";
+    btnToggleAllDiffEl.textContent = "Expand all";
     document.getElementById("btn-download-json").href = `/api/runs/${run.run_id}/plan-diff/export?format=json`;
     document.getElementById("btn-download-csv").href = `/api/runs/${run.run_id}/plan-diff/export?format=csv`;
 
@@ -1225,27 +1912,37 @@ async function showPlanDiff(run) {
       tr.className = "diff-row";
       tr.innerHTML = `
         <td><span class="expand-caret">&#9656;</span> <span class="action-badge ${rc.action}">${rc.action}</span></td>
-        <td class="resource-address">${escapeHtml(rc.address)}</td>
+        <td class="resource-address">${escapeHtml(rc.address)}<button class="copy-address-btn" data-tip="Copy resource address" aria-label="Copy resource address">&#128203;</button></td>
         <td class="changed-fields">${escapeHtml(rc.changed_fields.join(", "))}</td>
       `;
+      tr.querySelector(".copy-address-btn").onclick = async (ev) => {
+        ev.stopPropagation(); // don't also toggle the row's expand/collapse
+        try {
+          await navigator.clipboard.writeText(rc.address);
+          toast("Resource address copied.", { type: "success", duration: 2000 });
+        } catch (e) {
+          toast("Could not copy -- select and copy the address manually.", { type: "error" });
+        }
+      };
 
+      // The <tr> itself always stays in normal flow (table rows can't
+      // reliably transition height/display across browsers) -- expand/
+      // collapse instead animates an inner <div> wrapper's max-height, so
+      // it eases open/closed instead of the old instant show/hide.
       const detailRows = buildDetailRows(rc);
       const detailTr = document.createElement("tr");
-      detailTr.className = "diff-detail-row hidden";
+      detailTr.className = "diff-detail-row";
       const detailTd = document.createElement("td");
       detailTd.colSpan = 3;
-      detailTd.innerHTML = detailRows.length
+      const innerContent = detailRows.length
         ? `<table class="attr-table">${detailRows
-            .map(([k, v]) => `<tr><td class="attr-key">${escapeHtml(k)}</td><td class="attr-val">${escapeHtml(v)}</td></tr>`)
+            .map(([k, v]) => `<tr><td class="attr-key">${escapeHtml(k)}</td><td class="attr-val">${v}</td></tr>`)
             .join("")}</table>`
         : `<span class="muted">No attribute details available.</span>`;
+      detailTd.innerHTML = `<div class="diff-detail-inner">${innerContent}</div>`;
       detailTr.appendChild(detailTd);
 
-      tr.onclick = () => {
-        const expanded = !detailTr.classList.contains("hidden");
-        detailTr.classList.toggle("hidden", expanded);
-        tr.querySelector(".expand-caret").innerHTML = expanded ? "&#9656;" : "&#9662;";
-      };
+      tr.onclick = () => setDiffRowExpanded(tr, detailTr, !detailTr.classList.contains("expanded"));
 
       planDiffTableBodyEl.appendChild(tr);
       planDiffTableBodyEl.appendChild(detailTr);
@@ -1304,7 +2001,17 @@ function parseProgressLine(line) {
   m = RESOURCE_STILL_RE.exec(line);
   if (m) return { address: m[1], kind: progressActionKind(m[2]), phase: "progress", detail: m[3].trim() };
   m = RESOURCE_START_RE.exec(line);
-  if (m) return { address: m[1], kind: progressActionKind(m[2]), phase: "start" };
+  if (m) {
+    const kind = progressActionKind(m[2]);
+    // Unlike Creating/Destroying/Modifying/Reading, terraform never prints a
+    // matching "... refresh complete" line for "Refreshing state..." -- the
+    // one line (already carrying the resource's id) IS the complete event.
+    // Treating it as a "start" that some later line would finish left every
+    // refreshed resource stuck at "starting..." forever, even on a
+    // long-finished successful run.
+    if (kind === "refresh") return { address: m[1], kind, phase: "done", detail: "" };
+    return { address: m[1], kind, phase: "start" };
+  }
   return null;
 }
 
@@ -1343,9 +2050,9 @@ const PROGRESS_KIND_LABEL = { create: "create", update: "update", destroy: "dest
 
 function progressRowHtml(e) {
   const done = e.phase === "done";
-  const detailText = done ? `done in ${e.detail || "?"}` : e.detail ? `${e.detail} elapsed` : "starting…";
+  const detailText = done ? (e.detail ? `done in ${e.detail}` : "done") : e.detail ? `${e.detail} elapsed` : "starting…";
   return `<li class="progress-row ${done ? "done" : "running"} kind-${e.kind}">
-    <span class="progress-icon">${done ? "&#10003;" : ""}</span>
+    <span class="progress-icon">${done ? ICON_CHECK : ""}</span>
     <span class="progress-address">${escapeHtml(e.address)}</span>
     <span class="action-badge ${e.kind}">${PROGRESS_KIND_LABEL[e.kind] || e.kind}</span>
     <span class="progress-detail muted">${escapeHtml(detailText)}</span>
@@ -1471,15 +2178,36 @@ async function selectRun(runId) {
   const showsProgress = detail.kind === "plan" || detail.kind === "apply";
 
   if (detail.status === "success" || detail.status === "failed") {
-    setLogLines(detail.lines);
+    // hadProgress only needs detail.lines already in hand -- no fetch
+    // involved, so computing it doesn't cost a visible frame.
     const hadProgress = showsProgress && ingestProgressLines(detail.lines);
 
+    // Only default to the progress checklist for a SUCCESSFUL run -- it only
+    // ever shows completed create/update/destroy/read/refresh actions, never
+    // the failure itself (many failures, like this schema-validation error,
+    // aren't tied to any resource action at all), so defaulting to it on a
+    // failed run hid the one thing you actually opened this run to see
+    // behind an unlabeled extra click.
     if (detail.kind === "plan") {
       showPlanSummary(detail);
+      // Don't paint the raw log while the plan-diff fetch is in flight --
+      // that used to flash the raw terraform output for a moment before the
+      // table swapped in on every click. Show a lightweight placeholder
+      // instead, and only fall back to the real log if there's no diff to
+      // show after all.
+      logEl.innerHTML = `<div class="detail-loading">Loading…</div>`;
+      setDetailView("log");
       const diffShown = await showPlanDiff(detail);
-      if (!diffShown && hadProgress) showProgressView();
-    } else if (detail.kind === "apply" && hadProgress) {
+      if (!diffShown) {
+        setLogLines(detail.lines);
+        if (hadProgress && detail.status === "success") showProgressView();
+      }
+    } else if (detail.kind === "apply" && hadProgress && detail.status === "success") {
+      setLogLines(detail.lines);
       showProgressView();
+    } else {
+      setLogLines(detail.lines);
+      setDetailView("log");
     }
     if (detail.kind === "init") await refreshCurrentProjectInitState();
     return;
@@ -1510,15 +2238,24 @@ async function selectRun(runId) {
     if (finalDetail.kind === "plan") {
       showPlanSummary(finalDetail);
       const diffShown = await showPlanDiff(finalDetail);
-      if (!diffShown && currentProgress.size > 0) showProgressView();
-    } else if (finalDetail.kind === "apply" && currentProgress.size > 0) {
-      showProgressView();
+      if (!diffShown && currentProgress.size > 0 && finalDetail.status === "success") showProgressView();
+    } else if (finalDetail.kind === "apply") {
+      // A failed apply may have already auto-shown the live progress
+      // checklist while it was still running (es.onmessage, above) --
+      // switch back to the log/diagnostic-card view now that it's finished
+      // and failed, since the checklist alone never shows why.
+      if (currentProgress.size > 0 && finalDetail.status === "success") showProgressView();
+      else if (finalDetail.status !== "success") setDetailView("log");
     }
     if (finalDetail.kind === "init") await refreshCurrentProjectInitState();
   });
 }
 
 async function runInit() {
+  // The auth pill only reflects whatever was true when the workspace was
+  // opened -- re-check now so a login/logout in another window shows up
+  // before init runs, not just after it fails.
+  refreshAuthPill(currentProject.id);
   try {
     const { run_id } = await api(`/api/projects/${currentProject.id}/init`, { method: "POST" });
     await refreshRunsList();
@@ -1719,11 +2456,164 @@ btnToggleTfvarsRawEl.onclick = () => {
   setTfvarsView(tfvarsMode);
 };
 
+// ---------- state resource browser ----------
+
+const btnViewStateEl = document.getElementById("btn-view-state");
+const stateModalEl = document.getElementById("state-modal");
+const stateSummaryEl = document.getElementById("state-summary");
+const stateFilterInputEl = document.getElementById("state-filter-input");
+const stateErrorEl = document.getElementById("state-error");
+const stateListEl = document.getElementById("state-list");
+
+let allStateResources = [];
+// Detail fetches are cached per address for the lifetime of one modal open --
+// re-opening a resource you already expanded shouldn't re-hit terraform show.
+let stateDetailCache = {};
+
+function stateResourceRowHtml(r) {
+  const highlightsHtml = r.highlights
+    .map(([k, v]) => `<span class="state-highlight-chip"><span class="state-highlight-key">${escapeHtml(k)}</span>${escapeHtml(v)}</span>`)
+    .join("");
+  return `
+    <button class="state-row" data-address="${escapeHtml(r.address)}">
+      <div class="state-row-main">
+        <span class="state-row-type">${escapeHtml(r.type)}</span>
+        <span class="state-row-name">${escapeHtml(r.display_name)}</span>
+        ${r.module !== "(root)" ? `<span class="state-row-module">${escapeHtml(r.module)}</span>` : ""}
+      </div>
+      <div class="state-row-address">${escapeHtml(r.address)}</div>
+      ${highlightsHtml ? `<div class="state-row-highlights">${highlightsHtml}</div>` : ""}
+    </button>
+    <div class="state-detail-row" data-address="${escapeHtml(r.address)}">
+      <div class="state-detail-inner"></div>
+    </div>`;
+}
+
+function renderStateList(resources) {
+  stateListEl.innerHTML = resources.length
+    ? resources.map(stateResourceRowHtml).join("")
+    : `<p class="muted">No resources match this filter.</p>`;
+
+  stateListEl.querySelectorAll(".state-row").forEach((btn) => {
+    btn.onclick = () => toggleStateDetail(btn);
+  });
+}
+
+async function toggleStateDetail(btn) {
+  const address = btn.dataset.address;
+  const detailRow = stateListEl.querySelector(`.state-detail-row[data-address="${CSS.escape(address)}"]`);
+  const opening = !detailRow.classList.contains("expanded");
+  detailRow.classList.toggle("expanded", opening);
+  btn.classList.toggle("expanded", opening);
+  if (!opening) return;
+
+  const inner = detailRow.querySelector(".state-detail-inner");
+  if (stateDetailCache[address]) {
+    inner.innerHTML = stateDetailCache[address];
+    return;
+  }
+  inner.innerHTML = `<span class="muted">Loading…</span>`;
+  try {
+    const detail = await api(`/api/projects/${currentProject.id}/state/resource?address=${encodeURIComponent(address)}`);
+    const keys = Object.keys(detail.values || {});
+    const html = keys.length
+      ? `<table class="attr-table">${keys
+          .map((k) => `<tr><td class="attr-key">${escapeHtml(k)}</td><td class="attr-val">${escapeHtml(formatAttrValue(detail.values[k]))}</td></tr>`)
+          .join("")}</table>`
+      : `<span class="muted">No attributes.</span>`;
+    stateDetailCache[address] = html;
+    inner.innerHTML = html;
+  } catch (e) {
+    inner.innerHTML = `<span class="muted">Could not load details: ${escapeHtml(e.message)}</span>`;
+  }
+}
+
+function applyStateFilter() {
+  const q = stateFilterInputEl.value.trim().toLowerCase();
+  const filtered = q
+    ? allStateResources.filter(
+        (r) => r.address.toLowerCase().includes(q) || r.type.toLowerCase().includes(q) || r.display_name.toLowerCase().includes(q)
+      )
+    : allStateResources;
+  renderStateList(filtered);
+}
+stateFilterInputEl.addEventListener("input", applyStateFilter);
+
+btnViewStateEl.onclick = async () => {
+  stateErrorEl.classList.add("hidden");
+  stateFilterInputEl.value = "";
+  stateSummaryEl.textContent = "";
+  stateListEl.innerHTML = `<p class="muted">Loading…</p>`;
+  stateDetailCache = {};
+  allStateResources = [];
+  openModal(stateModalEl);
+
+  try {
+    allStateResources = await api(`/api/projects/${currentProject.id}/state/resources`);
+    stateSummaryEl.textContent = allStateResources.length
+      ? `${allStateResources.length} resource${allStateResources.length === 1 ? "" : "s"} in state.`
+      : "Nothing in state yet -- run apply first.";
+    renderStateList(allStateResources);
+  } catch (e) {
+    stateErrorEl.textContent = e.message;
+    stateErrorEl.classList.remove("hidden");
+    stateListEl.innerHTML = "";
+  }
+};
+
+// ---------- module & provider source explorer ----------
+
+const btnViewSourcesEl = document.getElementById("btn-view-sources");
+const sourcesModalEl = document.getElementById("sources-modal");
+const sourcesErrorEl = document.getElementById("sources-error");
+const sourcesModulesListEl = document.getElementById("sources-modules-list");
+const sourcesProvidersListEl = document.getElementById("sources-providers-list");
+
+function moduleRowHtml(m) {
+  return `
+    <div class="source-row">
+      <span class="source-row-name">${escapeHtml(m.name)}</span>
+      <span class="source-row-source">${escapeHtml(m.source)}</span>
+      <span class="source-row-version">${m.version ? escapeHtml(m.version) : `<span class="muted">unpinned</span>`}</span>
+      <span class="source-row-file">${escapeHtml(m.file)}</span>
+    </div>`;
+}
+
+function providerRowHtml(p) {
+  return `
+    <div class="source-row">
+      <span class="source-row-name">${escapeHtml(p.name)}</span>
+      <span class="source-row-source">${p.source ? escapeHtml(p.source) : `<span class="muted">-</span>`}</span>
+      <span class="source-row-version">${p.version_constraint ? escapeHtml(p.version_constraint) : `<span class="muted">unconstrained</span>`}</span>
+      <span class="source-row-file">${escapeHtml(p.file)}</span>
+    </div>`;
+}
+
+btnViewSourcesEl.onclick = async () => {
+  sourcesErrorEl.classList.add("hidden");
+  sourcesModulesListEl.innerHTML = `<p class="muted">Loading…</p>`;
+  sourcesProvidersListEl.innerHTML = "";
+  openModal(sourcesModalEl);
+
+  try {
+    const { modules, providers } = await api(`/api/projects/${currentProject.id}/sources`);
+    sourcesModulesListEl.innerHTML = modules.length
+      ? modules.map(moduleRowHtml).join("")
+      : `<p class="muted">No module blocks found in this deployment's .tf files.</p>`;
+    sourcesProvidersListEl.innerHTML = providers.length
+      ? providers.map(providerRowHtml).join("")
+      : `<p class="muted">No required_providers block found.</p>`;
+  } catch (e) {
+    sourcesErrorEl.textContent = e.message;
+    sourcesErrorEl.classList.remove("hidden");
+    sourcesModulesListEl.innerHTML = "";
+  }
+};
+
 // ---------- restart server ----------
+// Called from the header dropdown menu (see "header menu" below).
 
-const btnRestartServerEl = document.getElementById("btn-restart-server");
-
-btnRestartServerEl.onclick = async () => {
+async function restartServer() {
   let activeCount = 0;
   try {
     ({ count: activeCount } = await api("/api/server/active-runs"));
@@ -1746,7 +2636,7 @@ btnRestartServerEl.onclick = async () => {
     toast(`Could not start restart: ${e.message}`, { type: "error" });
     return;
   }
-  toast("Restarting -- this page will reload automatically once the server is back.", { type: "info", duration: 8000 });
+  toast("Restarting -- this page will reload automatically once the server is back.", { type: "warning", duration: 8000 });
 
   // Poll for the server coming back up, then reload for a clean state
   // (rather than trying to re-sync every in-memory view/modal by hand).
@@ -1765,16 +2655,717 @@ btnRestartServerEl.onclick = async () => {
     }
   };
   pollUntilBack();
-};
+}
 
 // ---------- open in VS Code ----------
 
+function openFileEditorInNewTab() {
+  const url = `/editor/${encodeURIComponent(currentOrg.name)}/${encodeURIComponent(currentProject.name)}`;
+  window.open(url, "_blank");
+}
+
 btnOpenVscodeEl.onclick = async () => {
+  const originalText = btnOpenVscodeEl.textContent;
+  btnOpenVscodeEl.disabled = true;
+  btnOpenVscodeEl.textContent = "Opening…";
   try {
     await api(`/api/projects/${currentProject.id}/open-vscode`, { method: "POST" });
   } catch (e) {
-    toast(`Could not open VS Code: ${e.message}`, { type: "error", duration: 7000 });
+    // VS Code isn't guaranteed to be installed/on PATH on this machine
+    // (see open_in_vscode in run_manager.py) -- rather than leave you with
+    // just an error and no way to actually edit the files, fall back to
+    // the editor this dashboard already has built in.
+    toast(`Could not open VS Code (${e.message}) -- opening the in-app editor instead.`, {
+      type: "error",
+      duration: 7000,
+    });
+    openFileEditorInNewTab();
+  } finally {
+    btnOpenVscodeEl.disabled = false;
+    btnOpenVscodeEl.textContent = originalText;
   }
 };
+
+btnOpenEditorEl.onclick = openFileEditorInNewTab;
+
+// ---------- in-app file editor (Monaco) ----------
+//
+// Opens in its own browser tab (see the /editor/<org>/<project> route in
+// restoreFromLocation above) rather than as another view swapped into the
+// current tab -- editing is a separate, longer-lived task from watching a
+// run, and a second tab means you can keep both on screen instead of
+// bouncing back and forth. That tab is still the exact same SPA; it just
+// boots straight into showFileEditor() instead of the landing page.
+
+const editorProjectNameEl = document.getElementById("editor-project-name");
+const editorFilePathEl = document.getElementById("editor-file-path");
+const editorDirtyBadgeEl = document.getElementById("editor-dirty-badge");
+const editorBlockedBadgeEl = document.getElementById("editor-blocked-badge");
+const btnSaveFileEl = document.getElementById("btn-save-file");
+const editorFileFilterEl = document.getElementById("editor-file-filter");
+const editorFileTreeListEl = document.getElementById("editor-file-tree-list");
+const editorEmptyStateEl = document.getElementById("editor-empty-state");
+const monacoContainerEl = document.getElementById("monaco-container");
+
+let editorProject = null;
+let editorFiles = [];
+let editorModels = new Map(); // path -> {model, originalContent}
+let editorCurrentPath = null;
+let monacoLoadPromise = null;
+
+// The AMD loader + editor core is ~24MB vendored under static/vendor/monaco
+// (see server.py's /vendor/{filepath:path} route) -- loaded lazily, once,
+// only when the editor is actually opened, so every OTHER page load isn't
+// paying for it.
+function loadMonaco() {
+  if (monacoLoadPromise) return monacoLoadPromise;
+  monacoLoadPromise = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "/vendor/monaco/vs/loader.js";
+    script.onload = () => {
+      window.require.config({ paths: { vs: "/vendor/monaco/vs" } });
+      window.require(["vs/editor/editor.main"], () => resolve(window.monaco), reject);
+    };
+    script.onerror = () => reject(new Error("could not load the editor (static/vendor/monaco missing?)"));
+    document.head.appendChild(script);
+  });
+  return monacoLoadPromise;
+}
+
+function guessMonacoLanguage(path) {
+  const ext = path.split(".").pop().toLowerCase();
+  if (["tf", "tfvars", "tfbackend", "hcl"].includes(ext)) return "hcl";
+  if (ext === "json") return "json";
+  if (ext === "md") return "markdown";
+  if (ext === "yaml" || ext === "yml") return "yaml";
+  return "plaintext";
+}
+
+function isEditorPathDirty(path) {
+  const s = editorModels.get(path);
+  return !!s && s.model.getValue() !== s.originalContent;
+}
+
+// Once a file's opened, its content lived only in the in-memory Monaco
+// model -- an edit made outside the dashboard (another editor, git, a
+// terraform fmt run) never showed up until the whole tab reloaded. This
+// pulls the on-disk content back in, but only when there are no local
+// unsaved edits to clobber; if the model is dirty, an external change is
+// silently ignored here (Save will still overwrite it, same as any editor).
+async function refreshEditorFileIfUnchangedLocally(path, { toastOnChange = false } = {}) {
+  const state = editorModels.get(path);
+  if (!state || state.model.getValue() !== state.originalContent) return;
+
+  let data;
+  try {
+    data = await api(`/api/projects/${editorProject.id}/file?path=${encodeURIComponent(path)}`);
+  } catch (e) {
+    return; // transient (e.g. file briefly locked while something else saves it) -- next tick will retry
+  }
+  if (data.content === state.originalContent) return;
+
+  const isActive = path === editorCurrentPath;
+  const viewState = isActive && monacoEditorInstance ? monacoEditorInstance.saveViewState() : null;
+  // originalContent MUST be updated before setValue, not after: setValue
+  // fires onDidChangeModelContent synchronously, and that handler reads
+  // originalContent to decide dirtiness -- updating it afterward meant the
+  // dirty badge saw (new model value) !== (still-old originalContent) at
+  // the instant the event fired, latched "unsaved changes" on, and nothing
+  // ever re-checked it afterward to clear it, even though the two values
+  // were actually equal again a line later.
+  state.originalContent = data.content;
+  state.model.setValue(data.content);
+  if (isActive && monacoEditorInstance && viewState) monacoEditorInstance.restoreViewState(viewState);
+  if (toastOnChange) toast(`${path} changed on disk -- reloaded.`, { type: "info", duration: 3500 });
+}
+
+let editorPollTimer = null;
+
+function startEditorPoll() {
+  stopEditorPoll();
+  editorPollTimer = setInterval(() => {
+    if (editorCurrentPath) refreshEditorFileIfUnchangedLocally(editorCurrentPath, { toastOnChange: true });
+  }, 3000);
+}
+
+function stopEditorPoll() {
+  if (editorPollTimer) {
+    clearInterval(editorPollTimer);
+    editorPollTimer = null;
+  }
+}
+
+function hasAnyUnsavedEditorChanges() {
+  return [...editorModels.keys()].some(isEditorPathDirty);
+}
+
+function updateEditorDirtyState() {
+  const dirty = editorCurrentPath !== null && isEditorPathDirty(editorCurrentPath);
+  editorDirtyBadgeEl.classList.toggle("hidden", !dirty);
+  btnSaveFileEl.disabled = editorCurrentPath === null;
+}
+
+// Builds a real nested {name, type, children|entry} tree from the flat
+// /files listing, folders-before-files then alphabetical at each level --
+// only used when there's no filter text (see renderEditorFileTree), since
+// filtering a tree in place means re-expanding every ancestor of a match,
+// and a flat "path contains query" list finds the same file just as fast.
+function buildEditorFileTree(entries) {
+  const root = { name: "", type: "dir", children: new Map() };
+  for (const entry of entries) {
+    const parts = entry.path.split("/");
+    let node = root;
+    parts.forEach((name, i) => {
+      if (i === parts.length - 1) {
+        node.children.set(name, { name, type: "file", entry });
+        return;
+      }
+      if (!node.children.has(name)) node.children.set(name, { name, type: "dir", children: new Map() });
+      node = node.children.get(name);
+    });
+  }
+  return root;
+}
+
+const EDITOR_ICON_EXTS = new Set(["tf", "tfvars", "tfbackend", "hcl", "json", "yaml", "yml", "md", "txt"]);
+
+function editorFileIconHtml(path) {
+  const ext = path.split(".").pop().toLowerCase();
+  const cls = EDITOR_ICON_EXTS.has(ext) ? ext : "other";
+  return `<span class="file-icon ext-${cls}"></span>`;
+}
+
+function editorFileRowHtml(entry, label) {
+  const classes = ["editor-file-row"];
+  if (!entry.editable) classes.push("unsupported");
+  if (entry.path === editorCurrentPath) classes.push("active");
+  if (isEditorPathDirty(entry.path)) classes.push("file-dirty");
+  const tip = entry.editable ? "" : ` data-tip="This file type isn't editable here"`;
+  return `<button class="${classes.join(" ")}" data-path="${escapeHtml(entry.path)}"${
+    entry.editable ? "" : " disabled"
+  }${tip}>${editorFileIconHtml(entry.path)}${escapeHtml(label)}</button>`;
+}
+
+// Which folders are expanded, keyed by their full slash-joined path from
+// the project root -- collapsed (not present in this set) by default, since
+// a real terraform project's full tree (modules/, every deployment, every
+// environment file) is long enough that starting fully expanded meant
+// scrolling past everything just to find one file.
+let editorExpandedDirs = new Set();
+
+function renderEditorFileTreeNode(node, parentPath = "") {
+  const items = [...node.children.values()].sort((a, b) => {
+    if (a.type !== b.type) return a.type === "dir" ? -1 : 1;
+    return a.name.localeCompare(b.name);
+  });
+  return items
+    .map((item) => {
+      if (item.type !== "dir") return editorFileRowHtml(item.entry, item.name);
+      const dirPath = parentPath ? `${parentPath}/${item.name}` : item.name;
+      const open = editorExpandedDirs.has(dirPath);
+      return `<details class="editor-dir" data-dir-path="${escapeHtml(dirPath)}"${
+        open ? " open" : ""
+      }><summary class="editor-file-row"><span class="file-dir">${escapeHtml(item.name)}/</span></summary>${renderEditorFileTreeNode(
+        item,
+        dirPath
+      )}</details>`;
+    })
+    .join("");
+}
+
+function collectEditorDirPaths(node, parentPath, out) {
+  for (const item of node.children.values()) {
+    if (item.type !== "dir") continue;
+    const dirPath = parentPath ? `${parentPath}/${item.name}` : item.name;
+    out.push(dirPath);
+    collectEditorDirPaths(item, dirPath, out);
+  }
+  return out;
+}
+
+// Called after opening a file so its folder (and every ancestor folder) is
+// guaranteed visible -- otherwise jumping to a file via the filter box, or
+// re-opening one after a poll refresh, could land you on a file buried
+// inside folders that are still collapsed.
+function expandEditorAncestorsOf(path) {
+  const parts = path.split("/");
+  let acc = "";
+  for (let i = 0; i < parts.length - 1; i++) {
+    acc = acc ? `${acc}/${parts[i]}` : parts[i];
+    editorExpandedDirs.add(acc);
+  }
+}
+
+function renderEditorFileTree() {
+  const q = editorFileFilterEl.value.trim().toLowerCase();
+  if (q) {
+    const matches = editorFiles.filter((e) => e.path.toLowerCase().includes(q));
+    editorFileTreeListEl.innerHTML = matches.length
+      ? matches.map((e) => editorFileRowHtml(e, e.path)).join("")
+      : `<p class="muted" style="padding:10px;">No files match.</p>`;
+  } else {
+    editorFileTreeListEl.innerHTML = renderEditorFileTreeNode(buildEditorFileTree(editorFiles));
+  }
+}
+editorFileFilterEl.addEventListener("input", renderEditorFileTree);
+
+// <details>'s own "toggle" event doesn't bubble, but a capturing listener
+// still sees it on the way down to the target regardless -- one delegated
+// listener instead of wiring one per folder (which get torn down and
+// rebuilt on every render anyway).
+editorFileTreeListEl.addEventListener(
+  "toggle",
+  (ev) => {
+    const details = ev.target;
+    if (!details.classList || !details.classList.contains("editor-dir")) return;
+    const dirPath = details.dataset.dirPath;
+    if (details.open) editorExpandedDirs.add(dirPath);
+    else editorExpandedDirs.delete(dirPath);
+  },
+  true
+);
+
+const btnToggleAllEditorDirsEl = document.getElementById("btn-toggle-all-editor-dirs");
+btnToggleAllEditorDirsEl.onclick = () => {
+  const expanding = btnToggleAllEditorDirsEl.textContent === "Expand all";
+  editorExpandedDirs = expanding ? new Set(collectEditorDirPaths(buildEditorFileTree(editorFiles), "", [])) : new Set();
+  btnToggleAllEditorDirsEl.textContent = expanding ? "Collapse all" : "Expand all";
+  renderEditorFileTree();
+};
+
+editorFileTreeListEl.onclick = (ev) => {
+  const btn = ev.target.closest(".editor-file-row[data-path]");
+  if (btn && !btn.disabled) openEditorFile(btn.dataset.path);
+};
+
+async function openEditorFile(path) {
+  const entry = editorFiles.find((e) => e.path === path);
+  if (!entry || !entry.editable) return;
+
+  let monaco;
+  try {
+    monaco = await loadMonaco();
+  } catch (e) {
+    toast(e.message, { type: "error" });
+    return;
+  }
+
+  if (!monacoEditorInstance) {
+    editorEmptyStateEl.classList.add("hidden");
+    monacoContainerEl.classList.remove("hidden");
+    monacoEditorInstance = monaco.editor.create(monacoContainerEl, {
+      theme: document.documentElement.dataset.theme === "dark" ? "vs-dark" : "vs",
+      automaticLayout: true,
+      fontSize: 13,
+      fontFamily: "Cascadia Mono, Consolas, monospace",
+      minimap: { enabled: true },
+      wordWrap: "off",
+    });
+    monacoEditorInstance.onDidChangeModelContent(() => {
+      updateEditorDirtyState();
+      renderEditorFileTree();
+      scheduleAutoSave();
+    });
+    monacoEditorInstance.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, () => btnSaveFileEl.click());
+  }
+
+  let state = editorModels.get(path);
+  if (!state) {
+    let data;
+    try {
+      data = await api(`/api/projects/${editorProject.id}/file?path=${encodeURIComponent(path)}`);
+    } catch (e) {
+      toast(`Could not open ${path}: ${e.message}`, { type: "error" });
+      return;
+    }
+    const model = monaco.editor.createModel(data.content, guessMonacoLanguage(path));
+    state = { model, originalContent: data.content };
+    editorModels.set(path, state);
+  } else {
+    // Already cached from earlier in this session -- pull the latest disk
+    // content in case it changed since then (edited elsewhere, or by a
+    // fmt/apply run) while this file wasn't the one being watched by the
+    // poll timer. No-ops if there are local unsaved edits.
+    await refreshEditorFileIfUnchangedLocally(path);
+  }
+
+  editorCurrentPath = path;
+  monacoEditorInstance.setModel(state.model);
+  editorFilePathEl.textContent = path;
+  updateEditorDirtyState();
+  expandEditorAncestorsOf(path);
+  renderEditorFileTree();
+}
+
+// Shared by the Save button and auto-save. `path` defaults to whatever's
+// currently open, but auto-save passes the path it was SCHEDULED for
+// explicitly -- its debounce timer fires ~1.5s later, and if the user
+// switched to a different file in the meantime, editorCurrentPath would no
+// longer be the file that was actually edited.
+async function saveCurrentEditorFile({ silent = false, path = editorCurrentPath } = {}) {
+  if (!path) return;
+  const state = editorModels.get(path);
+  if (!state || state.model.getValue() === state.originalContent) return; // nothing changed -- e.g. an auto-save tick after a manual save already ran
+  const content = state.model.getValue();
+  btnSaveFileEl.disabled = true;
+  try {
+    await api(`/api/projects/${editorProject.id}/file`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path, content }),
+    });
+    state.originalContent = content;
+    editorBlockedBadgeEl.classList.add("hidden");
+    if (!silent) {
+      toast(`Saved ${path}.`, {
+        type: "success",
+        action: { label: "Validate", onClick: () => runFileEditorValidate() },
+      });
+    }
+  } catch (e) {
+    // The backend hard-blocks a save while a run is in progress for this
+    // project (see write_project_file) -- that's the actual safety net, not
+    // this badge. The badge just makes WHY it failed visible at a glance
+    // instead of only in a toast that's gone in a few seconds.
+    editorBlockedBadgeEl.classList.toggle("hidden", !/in progress/i.test(e.message));
+    toast(`Could not save${silent ? " (auto-save)" : ""}: ${e.message}`, { type: "error", duration: 7000 });
+  } finally {
+    updateEditorDirtyState();
+    renderEditorFileTree();
+    btnSaveFileEl.disabled = false;
+  }
+}
+
+btnSaveFileEl.onclick = () => saveCurrentEditorFile({ silent: false });
+
+// ---------- editor auto-save ----------
+
+const AUTOSAVE_KEY = "iac-dashboard-editor-autosave";
+const AUTOSAVE_DEBOUNCE_MS = 1500;
+const chkAutosaveEl = document.getElementById("chk-autosave");
+const autosaveIndicatorEl = document.getElementById("autosave-indicator");
+let editorAutoSaveEnabled = localStorage.getItem(AUTOSAVE_KEY) === "true";
+let autoSaveDebounceTimer = null;
+
+chkAutosaveEl.checked = editorAutoSaveEnabled;
+autosaveIndicatorEl.classList.toggle("hidden", !editorAutoSaveEnabled);
+chkAutosaveEl.onchange = () => {
+  editorAutoSaveEnabled = chkAutosaveEl.checked;
+  localStorage.setItem(AUTOSAVE_KEY, String(editorAutoSaveEnabled));
+  autosaveIndicatorEl.classList.toggle("hidden", !editorAutoSaveEnabled);
+};
+
+function scheduleAutoSave() {
+  if (!editorAutoSaveEnabled || !editorCurrentPath) return;
+  const pathAtScheduleTime = editorCurrentPath;
+  clearTimeout(autoSaveDebounceTimer);
+  autoSaveDebounceTimer = setTimeout(() => saveCurrentEditorFile({ silent: true, path: pathAtScheduleTime }), AUTOSAVE_DEBOUNCE_MS);
+}
+
+// A standalone terraform-validate call for the editor tab -- it can't reuse
+// runValidate() as-is, since that reads/writes the workspace tab's own run
+// list and selects the run into ITS detail panel; here, all we want is the
+// pass/fail verdict as a toast.
+async function runFileEditorValidate() {
+  try {
+    const { run_id } = await api(`/api/projects/${editorProject.id}/validate`, { method: "POST" });
+    for (let i = 0; i < 60; i++) {
+      await new Promise((r) => setTimeout(r, 1000));
+      const run = await api(`/api/runs/${run_id}`);
+      if (run.status === "success" || run.status === "failed") {
+        toast(run.status === "success" ? "Validate passed." : "Validate failed -- check the workspace tab for details.", {
+          type: run.status === "success" ? "success" : "error",
+        });
+        return;
+      }
+    }
+  } catch (e) {
+    toast(`Could not run validate: ${e.message}`, { type: "error" });
+  }
+}
+
+async function showFileEditor(project, { pushHistory = true } = {}) {
+  editorProject = project;
+  editorFiles = [];
+  editorModels = new Map();
+  editorCurrentPath = null;
+
+  revealView(editorViewEl);
+  hideBgParticles();
+  renderBreadcrumb([
+    { label: "IaC-Dashboard", onClick: showLanding },
+    { label: currentOrg.name, onClick: () => showOrgView(currentOrg) },
+    { label: project.name, onClick: () => openWorkspace(project) },
+    { label: "Edit Files" },
+  ]);
+  btnBackEl.classList.remove("hidden");
+  btnBackEl.textContent = "←";
+  editorProjectNameEl.textContent = project.name;
+  editorFilePathEl.textContent = "";
+  editorDirtyBadgeEl.classList.add("hidden");
+  editorBlockedBadgeEl.classList.add("hidden");
+  editorEmptyStateEl.classList.remove("hidden");
+  monacoContainerEl.classList.add("hidden");
+  if (monacoEditorInstance) monacoEditorInstance.setModel(null);
+  editorFileFilterEl.value = "";
+  editorExpandedDirs = new Set();
+  btnToggleAllEditorDirsEl.textContent = "Expand all";
+  closeTerminal(); // switching projects (or a fresh load) -- any previous project's terminal session must not carry over
+  document.title = `Edit — ${project.name} — IaC-Dashboard`;
+
+  if (pushHistory) {
+    const url = `/editor/${encodeURIComponent(currentOrg.name)}/${encodeURIComponent(project.name)}`;
+    if (location.pathname !== url) history.pushState({}, "", url);
+  }
+
+  try {
+    editorFiles = await api(`/api/projects/${project.id}/files`);
+  } catch (e) {
+    toast(`Could not list files: ${e.message}`, { type: "error" });
+    editorFiles = [];
+  }
+  renderEditorFileTree();
+  startEditorPoll();
+}
+
+// Editing happens in its own tab, so the two places changes could
+// otherwise silently vanish are: closing/reloading THIS tab (native
+// beforeunload), and this tab's own in-app Back button navigating away
+// from the editor view without ever unloading the page.
+window.addEventListener("beforeunload", (ev) => {
+  if (!editorViewEl.classList.contains("hidden") && hasAnyUnsavedEditorChanges()) {
+    ev.preventDefault();
+    ev.returnValue = "";
+  }
+});
+
+async function closeFileEditor() {
+  if (hasAnyUnsavedEditorChanges()) {
+    const ok = await confirmDialog("You have unsaved changes in the editor. Discard them and leave?", {
+      title: "Discard unsaved changes?",
+      okLabel: "Discard & leave",
+    });
+    if (!ok) return;
+    clearTimeout(autoSaveDebounceTimer); // explicitly discarded -- a pending auto-save must not resurrect it after leaving
+  }
+  stopEditorPoll();
+  closeTerminal();
+  openWorkspace(editorProject);
+}
+
+// ---------- in-app terminal (real PTY over a websocket) ----------
+//
+// A real shell, not a sandboxed command runner -- cwd is fixed to this
+// project's own deployment folder at spawn time (see spawn_terminal in
+// run_manager.py), but once it's running it's exactly as capable as any
+// terminal you'd open yourself: it can cd elsewhere, run anything. That's
+// inherent to "give me a real terminal," not a bug to route around.
+
+const btnToggleTerminalEl = document.getElementById("btn-toggle-terminal");
+const terminalPanelEl = document.getElementById("terminal-panel");
+const terminalPanelTitleEl = document.getElementById("terminal-panel-title");
+const terminalStatusEl = document.getElementById("terminal-status");
+const btnRestartTerminalEl = document.getElementById("btn-restart-terminal");
+const btnCloseTerminalEl = document.getElementById("btn-close-terminal");
+const xtermContainerEl = document.getElementById("xterm-container");
+
+let xtermLoadPromise = null;
+let xtermInstance = null;
+let xtermFitAddon = null;
+let terminalSocket = null;
+
+function loadXterm() {
+  if (xtermLoadPromise) return xtermLoadPromise;
+  xtermLoadPromise = new Promise((resolve, reject) => {
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "/vendor/xterm/xterm.css";
+    document.head.appendChild(link);
+
+    const script = document.createElement("script");
+    script.src = "/vendor/xterm/xterm.js";
+    script.onload = () => {
+      const fitScript = document.createElement("script");
+      fitScript.src = "/vendor/xterm/addon-fit.js";
+      fitScript.onload = () => resolve({ Terminal: window.Terminal, FitAddon: window.FitAddon.FitAddon });
+      fitScript.onerror = () => reject(new Error("could not load the terminal (static/vendor/xterm missing?)"));
+      document.head.appendChild(fitScript);
+    };
+    script.onerror = () => reject(new Error("could not load the terminal (static/vendor/xterm missing?)"));
+    document.head.appendChild(script);
+  });
+  return xtermLoadPromise;
+}
+
+function connectTerminalSocket() {
+  const wsScheme = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${wsScheme}//${location.host}/api/projects/${editorProject.id}/terminal/ws`);
+  terminalStatusEl.textContent = "connecting…";
+
+  socket.onopen = () => {
+    terminalStatusEl.textContent = "";
+    if (xtermFitAddon) sendTerminalResize();
+  };
+  socket.onmessage = (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch (e) {
+      return;
+    }
+    if (msg.type === "output") xtermInstance.write(msg.data);
+    else if (msg.type === "error") {
+      terminalStatusEl.textContent = msg.message;
+      xtermInstance.write(`\r\n\x1b[31m[${msg.message}]\x1b[0m\r\n`);
+    } else if (msg.type === "exit") {
+      terminalStatusEl.textContent = "shell exited";
+      xtermInstance.write("\r\n\x1b[90m[process exited]\x1b[0m\r\n");
+    }
+  };
+  socket.onclose = () => {
+    if (terminalSocket === socket) terminalStatusEl.textContent = "disconnected";
+  };
+  socket.onerror = () => {
+    terminalStatusEl.textContent = "connection error";
+  };
+  return socket;
+}
+
+function sendTerminalResize() {
+  if (!terminalSocket || terminalSocket.readyState !== WebSocket.OPEN) return;
+  xtermFitAddon.fit();
+  terminalSocket.send(JSON.stringify({ type: "resize", rows: xtermInstance.rows, cols: xtermInstance.cols }));
+}
+
+async function openTerminal() {
+  terminalPanelEl.classList.remove("hidden");
+  terminalPanelTitleEl.textContent = `Terminal — ${editorProject.deployment}`;
+  btnToggleTerminalEl.classList.add("active-toggle");
+
+  if (!xtermInstance) {
+    let libs;
+    try {
+      libs = await loadXterm();
+    } catch (e) {
+      toast(e.message, { type: "error" });
+      return;
+    }
+    xtermInstance = new libs.Terminal({
+      fontSize: 13,
+      fontFamily: "Cascadia Mono, Consolas, monospace",
+      theme: { background: "#131a30", foreground: "#d7e3fb" },
+      cursorBlink: true,
+      scrollback: 5000,
+    });
+    xtermFitAddon = new libs.FitAddon();
+    xtermInstance.loadAddon(xtermFitAddon);
+    xtermInstance.open(xtermContainerEl);
+    xtermInstance.onData((data) => {
+      if (terminalSocket && terminalSocket.readyState === WebSocket.OPEN) {
+        terminalSocket.send(JSON.stringify({ type: "input", data }));
+      }
+    });
+  }
+
+  if (!terminalSocket || terminalSocket.readyState === WebSocket.CLOSED) {
+    terminalSocket = connectTerminalSocket();
+  }
+  setTimeout(sendTerminalResize, 50); // after the panel's own show transition/layout settles
+}
+
+function hideTerminalPanel() {
+  terminalPanelEl.classList.add("hidden");
+  btnToggleTerminalEl.classList.remove("active-toggle");
+}
+
+function closeTerminal() {
+  hideTerminalPanel();
+  if (terminalSocket) {
+    terminalSocket.close();
+    terminalSocket = null;
+  }
+  if (xtermInstance) {
+    xtermInstance.dispose();
+    xtermInstance = null;
+    xtermFitAddon = null;
+  }
+}
+
+btnToggleTerminalEl.onclick = () => {
+  if (terminalPanelEl.classList.contains("hidden")) openTerminal();
+  else hideTerminalPanel();
+};
+btnCloseTerminalEl.onclick = closeTerminal;
+btnRestartTerminalEl.onclick = () => {
+  if (terminalSocket) terminalSocket.close();
+  terminalSocket = connectTerminalSocket();
+  if (xtermInstance) xtermInstance.clear();
+  setTimeout(sendTerminalResize, 50);
+};
+window.addEventListener("resize", () => {
+  if (!terminalPanelEl.classList.contains("hidden")) sendTerminalResize();
+});
+
+// ---------- tools: name availability checker ----------
+
+const nameAvailabilityServiceSelectEl = document.getElementById("name-availability-service-select");
+const nameAvailabilityHintEl = document.getElementById("name-availability-hint");
+const storageNameInputEl = document.getElementById("storage-name-input");
+const btnCheckStorageNameEl = document.getElementById("btn-check-storage-name");
+const storageNameResultEl = document.getElementById("storage-name-result");
+
+let nameAvailabilityServices = [];
+
+function updateNameAvailabilityHint() {
+  const svc = nameAvailabilityServices.find((s) => s.id === nameAvailabilityServiceSelectEl.value);
+  nameAvailabilityHintEl.textContent = svc ? `Naming rules: ${svc.pattern_hint}.` : "";
+}
+
+async function loadNameAvailabilityServices() {
+  try {
+    nameAvailabilityServices = await api("/api/tools/name-availability-services");
+    nameAvailabilityServiceSelectEl.innerHTML = nameAvailabilityServices
+      .map((s) => `<option value="${escapeHtml(s.id)}">${escapeHtml(s.label)}</option>`)
+      .join("");
+    updateNameAvailabilityHint();
+  } catch (e) {
+    nameAvailabilityServiceSelectEl.innerHTML = `<option value="" disabled selected>could not load services</option>`;
+  }
+}
+nameAvailabilityServiceSelectEl.onchange = updateNameAvailabilityHint;
+loadNameAvailabilityServices();
+
+async function checkNameAvailability() {
+  const service = nameAvailabilityServiceSelectEl.value;
+  const name = storageNameInputEl.value.trim();
+  if (!service || !name) {
+    storageNameInputEl.focus();
+    return;
+  }
+  storageNameResultEl.className = "tool-result hidden";
+  btnCheckStorageNameEl.disabled = true;
+  btnCheckStorageNameEl.textContent = "Checking…";
+  try {
+    const result = await api("/api/tools/check-name-availability", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ service, name }),
+    });
+    storageNameResultEl.className = `tool-result ${result.name_available ? "ok" : "error"}`;
+    storageNameResultEl.textContent = result.name_available
+      ? `"${result.name}" is available.`
+      : `"${result.name}" is NOT available -- ${result.message || result.reason || "already taken or invalid"}`;
+  } catch (e) {
+    storageNameResultEl.className = "tool-result error";
+    storageNameResultEl.textContent = e.message;
+  } finally {
+    btnCheckStorageNameEl.disabled = false;
+    btnCheckStorageNameEl.textContent = "Check";
+  }
+}
+btnCheckStorageNameEl.onclick = checkNameAvailability;
+storageNameInputEl.addEventListener("keydown", (ev) => {
+  if (ev.key === "Enter") checkNameAvailability();
+});
 
 restoreFromLocation({ pushHistory: false });

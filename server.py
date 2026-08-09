@@ -26,11 +26,14 @@ import asyncio
 import csv
 import io
 import json
+import mimetypes
 import os
 
 import uvicorn
 from starlette.requests import Request
 from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.routing import WebSocketRoute
+from starlette.websockets import WebSocket, WebSocketDisconnect
 
 import run_manager as rm
 from mcp.server.mcpserver import MCPServer
@@ -248,6 +251,30 @@ async def check_auth(project_id: str) -> dict:
 
 
 @server.tool()
+async def check_name_availability(service: str, name: str) -> dict:
+    """Check whether a name is globally available for an Azure service --
+    several Azure resource types are namespaced across ALL of Azure, not
+    just one subscription (storage accounts, key vaults, container
+    registries, Cosmos DB accounts), which is exactly the kind of thing
+    worth confirming before writing a name into tfvars. `service` is one of
+    "storage_account", "key_vault", "container_registry", "cosmosdb_account"
+    (call list_name_availability_services to get this list programmatically
+    with hints). Read-only, not tied to any saved project."""
+    try:
+        return await asyncio.to_thread(rm.check_name_availability, service, name)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def list_name_availability_services() -> list:
+    """List the Azure services check_name_availability can check a name
+    against, each with a human label and a hint about that service's naming
+    rules."""
+    return rm.list_name_availability_services()
+
+
+@server.tool()
 async def get_tfvars(project_id: str) -> dict:
     """Read this project's tfvars file and return it parsed into a real
     nested dict/list/str/number/bool structure (`parsed`) instead of raw
@@ -258,6 +285,46 @@ async def get_tfvars(project_id: str) -> dict:
     with `parsed` set to null in that case -- fall back to `raw` then."""
     try:
         return await asyncio.to_thread(rm.get_tfvars, project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def get_state_resources(project_id: str) -> list:
+    """List everything actually deployed per this project's current
+    Terraform state -- address, type, terraform-local name, the real Azure
+    resource name, and a handful of highlight attributes (SKU/tier/size/
+    location, whichever apply) per resource. Read-only: runs
+    `terraform show -json` against local state, no plan, no Azure portal,
+    doesn't touch the state lock. Requires init_project to have succeeded
+    first. Empty list means the state is valid but nothing has been applied
+    yet."""
+    try:
+        return await asyncio.to_thread(rm.get_state_resources, project_id)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def get_state_resource_detail(project_id: str, address: str) -> dict:
+    """Full attribute values for one resource address from
+    get_state_resources (e.g. "module.storage_account.azurerm_storage_account.this"),
+    sensitive values redacted the same way plan diffs are."""
+    try:
+        return await asyncio.to_thread(rm.get_state_resource_detail, project_id, address)
+    except ValueError as e:
+        return {"error": str(e)}
+
+
+@server.tool()
+async def get_module_and_provider_sources(project_id: str) -> dict:
+    """Modules and required providers this deployment's own .tf files
+    declare -- {modules: [{name, source, version, file}], providers:
+    [{name, source, version_constraint, file}]}. Parsed straight from the
+    .tf source, not the lock file, so it reflects what's actually written
+    in the config (including an unpinned local module's source path)."""
+    try:
+        return await asyncio.to_thread(rm.get_module_and_provider_sources, project_id)
     except ValueError as e:
         return {"error": str(e)}
 
@@ -459,6 +526,24 @@ async def style_css(request: Request):
     return FileResponse(os.path.join(STATIC_DIR, "style.css"), media_type="text/css", headers=_NO_STORE_HEADERS)
 
 
+_VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
+
+
+@server.custom_route("/vendor/{filepath:path}", methods=["GET"])
+async def vendor_asset(request: Request):
+    """Serves vendored third-party assets (currently: the Monaco editor's
+    prebuilt AMD bundle, for the in-app file editor) -- these are content-
+    hashed by their own build and never change post-install, so unlike the
+    dashboard's own JS/CSS above this is safe (and worth it, ~150 small
+    files) to let the browser cache normally instead of no-store."""
+    filepath = request.path_params["filepath"]
+    full_path = os.path.normpath(os.path.join(_VENDOR_DIR, filepath))
+    if not full_path.startswith(os.path.normpath(_VENDOR_DIR) + os.sep) or not os.path.isfile(full_path):
+        return Response(status_code=404)
+    media_type, _ = mimetypes.guess_type(full_path)
+    return FileResponse(full_path, media_type=media_type or "application/octet-stream")
+
+
 # ===================================================================================
 # DASHBOARD -- REST API
 # ===================================================================================
@@ -472,6 +557,19 @@ async def api_active_runs(request: Request):
     return JSONResponse({"count": rm.count_active_runs()})
 
 
+@server.custom_route("/api/server/terraform-version", methods=["GET"])
+async def api_terraform_version(request: Request):
+    return JSONResponse({"version": await asyncio.to_thread(rm.get_terraform_version)})
+
+
+@server.custom_route("/api/notifications/recent", methods=["GET"])
+async def api_recent_notifications(request: Request):
+    """Cross-project feed of recently finished runs, for the notification
+    bell -- polled by the dashboard regardless of which project (if any) is
+    currently open."""
+    return JSONResponse(rm.list_recent_completions())
+
+
 @server.custom_route("/api/server/restart", methods=["POST"])
 async def api_restart_server(request: Request):
     """Restart the whole dashboard process. No confirmation token here (unlike
@@ -480,6 +578,25 @@ async def api_restart_server(request: Request):
     as an MCP tool."""
     try:
         return JSONResponse(await asyncio.to_thread(rm.restart_server))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/tools/name-availability-services", methods=["GET"])
+async def api_name_availability_services(request: Request):
+    return JSONResponse(rm.list_name_availability_services())
+
+
+@server.custom_route("/api/tools/check-name-availability", methods=["POST"])
+async def api_check_name_availability(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    missing = [k for k in ("service", "name") if k not in body]
+    if missing:
+        return JSONResponse({"error": f"missing required field(s): {missing}"}, status_code=400)
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.check_name_availability, body["service"], body["name"]))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -642,6 +759,78 @@ async def api_auth_check(request: Request):
 async def api_tfvars(request: Request):
     try:
         return JSONResponse(await asyncio.to_thread(rm.get_tfvars, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/state/resources", methods=["GET"])
+async def api_state_resources(request: Request):
+    """List (address/type/name/highlight attrs) of everything actually
+    deployed per the current state -- read-only, no plan or Azure portal
+    needed."""
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.get_state_resources, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/state/resource", methods=["GET"])
+async def api_state_resource_detail(request: Request):
+    address = request.query_params.get("address", "")
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.get_state_resource_detail, request.path_params["project_id"], address))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/sources", methods=["GET"])
+async def api_module_and_provider_sources(request: Request):
+    """Modules and required providers this deployment's own .tf files
+    declare, parsed straight from source -- not the lock file."""
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.get_module_and_provider_sources, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/files", methods=["GET"])
+async def api_list_project_files(request: Request):
+    """File tree for the in-app editor's file browser."""
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.list_project_files, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/file", methods=["GET"])
+async def api_read_project_file(request: Request):
+    path = request.query_params.get("path", "")
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.read_project_file, request.path_params["project_id"], path))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/file", methods=["PUT"])
+async def api_write_project_file(request: Request):
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "path" not in body or "content" not in body:
+        return JSONResponse({"error": "missing required field(s): path, content"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(rm.write_project_file, request.path_params["project_id"], body["path"], body["content"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=409 if "in progress" in str(e) else 400)
+
+
+@server.custom_route("/api/projects/{project_id}/versions", methods=["GET"])
+async def api_project_versions(request: Request):
+    """Terraform CLI version plus the provider versions selected for this
+    project's initialized working directory."""
+    try:
+        return JSONResponse(await asyncio.to_thread(rm.get_project_versions, request.path_params["project_id"]))
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -841,6 +1030,64 @@ async def project_deep_link(request: Request):
     same shell here is what makes a direct navigation or a page refresh on
     that URL work, instead of 404ing."""
     return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
+
+
+@server.custom_route("/editor/{org_name}/{project_name}", methods=["GET"])
+async def editor_deep_link(request: Request):
+    """SPA fallback for the in-app file editor's own tab -- see the
+    /editor/<org>/<project> route in app.js's restoreFromLocation()."""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
+
+
+# ===================================================================================
+# DASHBOARD -- in-app terminal (real PTY over a websocket)
+# ===================================================================================
+# @server.custom_route only registers plain HTTP routes (its `methods`
+# param is HTTP-verb-shaped), so this bypasses it and appends a raw
+# Starlette WebSocketRoute straight into the same routes list that decorator
+# builds up -- streamable_http_app() below consumes that list either way.
+
+
+async def terminal_ws(websocket: WebSocket):
+    project_id = websocket.path_params["project_id"]
+    await websocket.accept()
+    try:
+        session = await asyncio.to_thread(rm.spawn_terminal, project_id)
+    except (ValueError, RuntimeError) as e:
+        await websocket.send_text(json.dumps({"type": "error", "message": str(e)}))
+        await websocket.close()
+        return
+
+    async def pump_output():
+        loop = asyncio.get_event_loop()
+        while True:
+            data = await loop.run_in_executor(None, session.output_queue.get)
+            if data is None:  # sentinel -- the PTY's own read loop ended (shell exited)
+                await websocket.send_text(json.dumps({"type": "exit"}))
+                break
+            await websocket.send_text(json.dumps({"type": "output", "data": data}))
+
+    output_task = asyncio.create_task(pump_output())
+    try:
+        while True:
+            msg = await websocket.receive_text()
+            try:
+                parsed = json.loads(msg)
+            except json.JSONDecodeError:
+                continue
+            kind = parsed.get("type")
+            if kind == "input":
+                await asyncio.to_thread(session.write, parsed.get("data", ""))
+            elif kind == "resize":
+                await asyncio.to_thread(session.resize, int(parsed.get("rows", 24)), int(parsed.get("cols", 80)))
+    except WebSocketDisconnect:
+        pass
+    finally:
+        output_task.cancel()
+        await asyncio.to_thread(session.close)
+
+
+server._custom_starlette_routes.append(WebSocketRoute("/api/projects/{project_id}/terminal/ws", terminal_ws))
 
 
 app = server.streamable_http_app(host=HOST)

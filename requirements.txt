@@ -1,2 +1,5 @@
 mcp
 uvicorn
+websockets
+pywinpty; sys_platform == "win32"
+ptyprocess; sys_platform != "win32"
