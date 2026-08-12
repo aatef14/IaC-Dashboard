@@ -547,56 +547,130 @@ async def vendor_asset(request: Request):
 
 
 # ===================================================================================
-# DASHBOARD -- GitHub sign-in
+# DASHBOARD -- GitHub sign-in (Device Flow)
 # ===================================================================================
-# Entirely opt-in: without GITHUB_OAUTH_CLIENT_ID/SECRET set, these routes
-# still exist but AuthGateMiddleware below never redirects anyone to them --
-# the dashboard runs exactly as before. See README for setup.
+# Entirely opt-in: without GITHUB_OAUTH_CLIENT_ID set, these routes still
+# exist but AuthGateMiddleware below never redirects anyone to them -- the
+# dashboard runs exactly as before. See README for setup.
+#
+# Device Flow instead of the usual browser-redirect OAuth flow: no callback
+# URL to keep in sync with this machine's LAN IP (which changes across
+# networks). /auth/login asks GitHub for a device code and shows it in a
+# small standalone page; that page's own JS polls /auth/device/status until
+# the user approves it at github.com/login/device from any device.
+
+
+def _device_login_html(user_code: str, verification_uri: str, interval: int) -> str:
+    poll_ms = max(interval, 3) * 1000
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Sign in with GitHub</title>
+<style>
+  body {{ font-family: system-ui, sans-serif; background:#0f1420; color:#e7e7ec; display:flex;
+          align-items:center; justify-content:center; height:100vh; margin:0; }}
+  .card {{ background:#171d2e; border:1px solid #2a3350; border-radius:14px; padding:38px 44px;
+           text-align:center; max-width:420px; }}
+  h1 {{ font-size:15px; font-weight:600; margin:0 0 20px; color:#9aa5c9; }}
+  .code {{ font-size:32px; font-weight:700; letter-spacing:5px; background:#0f1420;
+           border:1px solid #2a3350; border-radius:8px; padding:14px 8px; margin-bottom:20px; }}
+  a.btn {{ display:inline-block; background:#2563eb; color:#fff; text-decoration:none;
+           padding:10px 22px; border-radius:8px; font-weight:600; margin-bottom:18px; }}
+  a.btn:hover {{ background:#1d4ed8; }}
+  #status {{ font-size:13px; color:#9aa5c9; }}
+</style></head>
+<body>
+  <div class="card">
+    <h1>Sign in to IaC-Dashboard with GitHub</h1>
+    <div class="code">{user_code}</div>
+    <div><a class="btn" href="{verification_uri}" target="_blank" rel="noopener">Open GitHub &amp; enter code</a></div>
+    <div id="status">Waiting for approval&hellip;</div>
+  </div>
+  <script>
+    async function poll() {{
+      try {{
+        const res = await fetch("/auth/device/status");
+        const body = await res.json();
+        if (body.status === "complete") {{
+          document.getElementById("status").textContent = "Signed in! Redirecting...";
+          window.location.href = "/";
+          return;
+        }}
+        if (body.status === "error") {{
+          document.getElementById("status").textContent = body.message;
+          return;
+        }}
+      }} catch (e) {{
+        document.getElementById("status").textContent = "Connection error, retrying...";
+      }}
+      setTimeout(poll, {poll_ms});
+    }}
+    setTimeout(poll, {poll_ms});
+  </script>
+</body></html>"""
 
 
 @server.custom_route("/auth/login", methods=["GET"])
 async def auth_login(request: Request):
     if not ghauth.GITHUB_AUTH_ENABLED:
         return JSONResponse({"error": "GitHub sign-in is not configured on this server"}, status_code=404)
-    redirect_uri = f"{request.url.scheme}://{request.headers['host']}/auth/callback"
-    state = ghauth.create_state_cookie_value()
-    resp = RedirectResponse(url=ghauth.github_authorize_url(redirect_uri, state))
-    resp.set_cookie(ghauth.STATE_COOKIE, state, max_age=ghauth.STATE_TTL_SECONDS, httponly=True, samesite="lax")
-    return resp
-
-
-@server.custom_route("/auth/callback", methods=["GET"])
-async def auth_callback(request: Request):
-    if not ghauth.GITHUB_AUTH_ENABLED:
-        return JSONResponse({"error": "GitHub sign-in is not configured on this server"}, status_code=404)
-    state_cookie = request.cookies.get(ghauth.STATE_COOKIE)
-    query_state = request.query_params.get("state")
-    if not ghauth.state_cookie_matches(state_cookie, query_state):
-        return JSONResponse({"error": "invalid or expired login attempt -- try signing in again"}, status_code=400)
-    code = request.query_params.get("code")
-    if not code:
-        return JSONResponse({"error": "GitHub did not return a code"}, status_code=400)
-
-    redirect_uri = f"{request.url.scheme}://{request.headers['host']}/auth/callback"
     try:
-        access_token = await asyncio.to_thread(ghauth.exchange_code_for_token, code, redirect_uri)
-        if not access_token:
-            raise ValueError("no access_token in GitHub's response")
-        user = await asyncio.to_thread(ghauth.fetch_github_user, access_token)
-        login = user["login"]
+        device = await asyncio.to_thread(ghauth.request_device_code)
+        user_code = device["user_code"]
+        verification_uri = device["verification_uri"]
+        interval = device["interval"]
+        expires_in = device["expires_in"]
     except Exception as e:
-        return JSONResponse({"error": f"GitHub sign-in failed: {e}"}, status_code=502)
+        return JSONResponse({"error": f"could not start GitHub sign-in: {e}"}, status_code=502)
 
-    resp = RedirectResponse(url="/")
+    resp = Response(_device_login_html(user_code, verification_uri, interval), media_type="text/html")
     resp.set_cookie(
-        ghauth.SESSION_COOKIE,
-        ghauth.create_session_cookie_value(login),
-        max_age=ghauth.SESSION_TTL_SECONDS,
+        ghauth.DEVICE_PENDING_COOKIE,
+        ghauth.create_device_pending_cookie_value(device["device_code"], interval, expires_in),
+        max_age=expires_in,
         httponly=True,
         samesite="lax",
     )
-    resp.delete_cookie(ghauth.STATE_COOKIE)
     return resp
+
+
+@server.custom_route("/auth/device/status", methods=["GET"])
+async def auth_device_status(request: Request):
+    if not ghauth.GITHUB_AUTH_ENABLED:
+        return JSONResponse({"status": "error", "message": "GitHub sign-in is not configured on this server"})
+    pending = ghauth.read_device_pending_cookie(request.cookies.get(ghauth.DEVICE_PENDING_COOKIE))
+    if not pending:
+        return JSONResponse({"status": "error", "message": "Login attempt expired -- refresh this page to try again."})
+    device_code, interval = pending
+
+    try:
+        result = await asyncio.to_thread(ghauth.poll_device_token, device_code)
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": f"GitHub sign-in failed: {e}"})
+
+    if result.get("access_token"):
+        try:
+            user = await asyncio.to_thread(ghauth.fetch_github_user, result["access_token"])
+            login = user["login"]
+        except Exception as e:
+            return JSONResponse({"status": "error", "message": f"Signed in, but couldn't read GitHub profile: {e}"})
+        resp = JSONResponse({"status": "complete"})
+        resp.set_cookie(
+            ghauth.SESSION_COOKIE,
+            ghauth.create_session_cookie_value(login),
+            max_age=ghauth.SESSION_TTL_SECONDS,
+            httponly=True,
+            samesite="lax",
+        )
+        resp.delete_cookie(ghauth.DEVICE_PENDING_COOKIE)
+        return resp
+
+    error = result.get("error")
+    if error in ("authorization_pending", "slow_down"):
+        return JSONResponse({"status": "pending"})
+    if error == "expired_token":
+        return JSONResponse({"status": "error", "message": "Code expired -- refresh this page to get a new one."})
+    if error == "access_denied":
+        return JSONResponse({"status": "error", "message": "Sign-in was denied."})
+    return JSONResponse({"status": "error", "message": result.get("error_description") or "Unexpected response from GitHub."})
 
 
 @server.custom_route("/auth/logout", methods=["GET", "POST"])
@@ -1210,7 +1284,7 @@ server._custom_starlette_routes.append(WebSocketRoute("/api/projects/{project_id
 # ===================================================================================
 
 _PUBLIC_PATH_PREFIXES = ("/auth/", "/vendor/")
-_PUBLIC_PATHS = {"/style.css", "/app.js"}
+_PUBLIC_PATHS = {"/style.css", "/app.js", "/api/auth/me"}
 
 
 class AuthGateMiddleware:

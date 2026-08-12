@@ -4,11 +4,12 @@
 # time. Leave any of these commented out / unset to skip that feature --
 # the dashboard runs fine with none of this configured (see README).
 
-# GitHub sign-in for the web dashboard. Create an OAuth App at
-# https://github.com/settings/developers -- Authorization callback URL must
-# be http://<the host/IP you access the dashboard at>:8765/auth/callback.
+# GitHub sign-in for the web dashboard (Device Flow -- see README). Create
+# an OAuth App at https://github.com/settings/developers, tick "Enable
+# Device Flow", then just paste its Client ID here. No client secret and no
+# callback URL to keep in sync with a roaming LAN IP -- Device Flow doesn't
+# use either.
 # $env:GITHUB_OAUTH_CLIENT_ID = "..."
-# $env:GITHUB_OAUTH_CLIENT_SECRET = "..."
 
 # Shared-secret protection for the /mcp endpoint (separate from GitHub
 # sign-in above -- Claude Code's MCP client can't do a browser OAuth

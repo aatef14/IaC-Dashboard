@@ -139,24 +139,34 @@ login) until you configure this. Worth turning on once you're sharing your
 LAN IP with anyone else, since that otherwise means anyone on the network
 can drive real Terraform runs with zero login at all.
 
+Uses GitHub's **Device Flow** rather than the usual browser-redirect OAuth
+login -- deliberately, since a redirect-based flow needs a fixed callback
+URL and this dashboard's LAN IP changes across networks (see **Starting /
+stopping** above). Device Flow has no callback URL at all: you open
+`github.com/login/device`, type in a short code, and the dashboard (which
+is polling in the background) picks up the sign-in the moment you approve
+it -- works identically no matter which network you're on. It also doesn't
+need a client secret (same model the `gh` CLI uses), so setup is one field:
+
 1. Create a GitHub OAuth App: **github.com -> Settings -> Developer settings
    -> OAuth Apps -> New OAuth App**.
-   - Homepage URL: `http://<the host/IP you access the dashboard at>:8765/`
-   - Authorization callback URL: same, with `/auth/callback` --
-     e.g. `http://192.168.1.23:8765/auth/callback`. This has to be an exact
-     match, so if your LAN IP changes (a different Wi-Fi network), update
-     this field to match before signing in from that network.
-   - Generate a Client Secret, note both it and the Client ID.
+   - Homepage URL / Authorization callback URL: neither is actually used by
+     Device Flow, so any value satisfies GitHub's "this field is required"
+     validation -- e.g. this repo's URL for both.
+   - Tick **Enable Device Flow** in the app's settings.
+   - Note the **Client ID** (that's the only credential needed -- no secret).
 2. Copy `secrets.example.ps1` to `secrets.local.ps1` (git-ignored -- stays
-   local to this machine) and fill in `GITHUB_OAUTH_CLIENT_ID` /
-   `GITHUB_OAUTH_CLIENT_SECRET`. `start.ps1` picks it up automatically on
-   every future start, no need to set env vars by hand each time.
+   local to this machine) and fill in `GITHUB_OAUTH_CLIENT_ID`. `start.ps1`
+   picks it up automatically on every future start, no need to set env vars
+   by hand each time.
 3. `.\stop.ps1` then `.\start.ps1` (or just re-run `install.ps1`).
 
-Once configured, any GitHub account can sign in -- there's no allowlist, so
-anyone who reaches the dashboard's URL and has a GitHub account gets in
-after authenticating. Signed-in users appear in the header menu (top-right
-&#9776;), which also has **Sign out**.
+Once configured, visiting the dashboard shows a code + a link to
+`github.com/login/device` instead of the normal UI until you approve it --
+then it redirects straight into the dashboard. Any GitHub account can sign
+in -- there's no allowlist, so anyone who reaches the dashboard's URL and
+has a GitHub account gets in after approving. Signed-in users appear in the
+header menu (top-right &#9776;), which also has **Sign out**.
 
 The MCP endpoint (`/mcp`, used by Claude Code) is separate from this --
 GitHub's OAuth flow doesn't fit a non-browser MCP client. If you want it

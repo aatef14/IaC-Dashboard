@@ -5,10 +5,18 @@ MCP client). Both are opt-in: if their env vars aren't set, the dashboard
 runs exactly as before (open, no login) -- so this never breaks an existing
 single-machine setup that never configured it.
 
+Uses GitHub's Device Flow, not the usual browser-redirect OAuth flow -- no
+callback URL to register or keep in sync with a roaming LAN IP (this
+dashboard has none of the fixed hostname a redirect-based flow needs). The
+user opens github.com/login/device, enters an 8-character code, and this
+server polls for the result -- works identically from any network. Device
+flow also doesn't require a client secret at all (it's a public-client
+flow, same model the `gh` CLI uses), so setup is just one Client ID.
+
 Session cookies are HMAC-signed with a key generated once and persisted to
 .session_secret (git-ignored) so logins survive a server restart. Stdlib
 only (hmac/urllib) -- no new pip dependency for a couple of signed cookies
-and two outbound HTTP calls.
+and a handful of outbound HTTP calls.
 """
 
 import base64
@@ -22,15 +30,13 @@ import urllib.parse
 import urllib.request
 
 GITHUB_OAUTH_CLIENT_ID = os.environ.get("GITHUB_OAUTH_CLIENT_ID")
-GITHUB_OAUTH_CLIENT_SECRET = os.environ.get("GITHUB_OAUTH_CLIENT_SECRET")
 MCP_SHARED_SECRET = os.environ.get("MCP_SHARED_SECRET")
 
-GITHUB_AUTH_ENABLED = bool(GITHUB_OAUTH_CLIENT_ID and GITHUB_OAUTH_CLIENT_SECRET)
+GITHUB_AUTH_ENABLED = bool(GITHUB_OAUTH_CLIENT_ID)
 
 SESSION_COOKIE = "iac_session"
-STATE_COOKIE = "iac_oauth_state"
+DEVICE_PENDING_COOKIE = "iac_device_pending"
 SESSION_TTL_SECONDS = 30 * 24 * 3600  # 30 days
-STATE_TTL_SECONDS = 300  # just long enough to complete the GitHub redirect round trip
 
 _SECRET_PATH = os.path.join(os.path.dirname(__file__), ".session_secret")
 
@@ -87,39 +93,50 @@ def read_session_cookie(token: str | None) -> str | None:
     return _verify(token)
 
 
-def create_state_cookie_value() -> str:
-    return _sign(secrets.token_urlsafe(16), STATE_TTL_SECONDS)
+def create_device_pending_cookie_value(device_code: str, interval: int, expires_in: int) -> str:
+    return _sign(f"{device_code}:{interval}", expires_in)
 
 
-def state_cookie_matches(cookie_value: str | None, query_state: str | None) -> bool:
-    if not cookie_value or not query_state:
-        return False
-    # The state param round-tripped through GitHub is itself the signed
-    # cookie value verbatim -- so a valid, unexpired signature is sufficient;
-    # no separate comparison needed beyond "they're the same string".
-    return hmac.compare_digest(cookie_value, query_state) and _verify(cookie_value) is not None
+def read_device_pending_cookie(token: str | None) -> tuple[str, int] | None:
+    """Returns (device_code, poll_interval_seconds), or None if
+    missing/tampered/expired."""
+    if not token:
+        return None
+    value = _verify(token)
+    if not value:
+        return None
+    try:
+        device_code, interval = value.rsplit(":", 1)
+        return device_code, int(interval)
+    except ValueError:
+        return None
 
 
-def github_authorize_url(redirect_uri: str, state: str) -> str:
-    params = urllib.parse.urlencode(
-        {
-            "client_id": GITHUB_OAUTH_CLIENT_ID,
-            "redirect_uri": redirect_uri,
-            "scope": "read:user",
-            "state": state,
-        }
+def request_device_code() -> dict:
+    """Blocking network call -- run via asyncio.to_thread from an async
+    route. Returns GitHub's {device_code, user_code, verification_uri,
+    expires_in, interval}."""
+    data = urllib.parse.urlencode({"client_id": GITHUB_OAUTH_CLIENT_ID, "scope": "read:user"}).encode()
+    req = urllib.request.Request(
+        "https://github.com/login/device/code",
+        data=data,
+        headers={"Accept": "application/json"},
+        method="POST",
     )
-    return f"https://github.com/login/oauth/authorize?{params}"
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode())
 
 
-def exchange_code_for_token(code: str, redirect_uri: str) -> str | None:
-    """Blocking network call -- run via asyncio.to_thread from an async route."""
+def poll_device_token(device_code: str) -> dict:
+    """Blocking network call -- run via asyncio.to_thread from an async
+    route. GitHub answers with HTTP 200 either way -- {access_token: ...}
+    on success, or {error: "authorization_pending" | "slow_down" |
+    "expired_token" | "access_denied"} while waiting/on failure."""
     data = urllib.parse.urlencode(
         {
             "client_id": GITHUB_OAUTH_CLIENT_ID,
-            "client_secret": GITHUB_OAUTH_CLIENT_SECRET,
-            "code": code,
-            "redirect_uri": redirect_uri,
+            "device_code": device_code,
+            "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
         }
     ).encode()
     req = urllib.request.Request(
@@ -129,11 +146,10 @@ def exchange_code_for_token(code: str, redirect_uri: str) -> str | None:
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=10) as resp:
-        result = json.loads(resp.read().decode())
-    return result.get("access_token")
+        return json.loads(resp.read().decode())
 
 
-def fetch_github_user(access_token: str) -> dict | None:
+def fetch_github_user(access_token: str) -> dict:
     """Blocking network call -- run via asyncio.to_thread from an async route."""
     req = urllib.request.Request(
         "https://api.github.com/user",
