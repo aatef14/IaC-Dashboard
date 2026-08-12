@@ -24,6 +24,12 @@ server.log
 server.log.err
 .server.pid
 
+# GitHub sign-in: the HMAC key sessions are signed with (generated on first
+# run), and your local copy of the GitHub OAuth client secret / MCP shared
+# secret (see secrets.example.ps1)
+.session_secret
+secrets.local.ps1
+
 # ---------------------------------------------------------------------------
 # Python
 # ---------------------------------------------------------------------------

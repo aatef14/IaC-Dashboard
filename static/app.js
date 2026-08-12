@@ -277,6 +277,13 @@ function revealView(el, { back = false } = {}) {
 
 async function api(path, opts) {
   const res = await fetch(path, opts);
+  if (res.status === 401) {
+    // Session expired/missing mid-use (not a plain "wrong creds" -- that
+    // never happens here, GitHub itself owns the actual login) -- bounce to
+    // GitHub sign-in rather than surfacing a confusing generic error toast.
+    window.location.href = "/auth/login";
+    throw new Error("not authenticated");
+  }
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || `HTTP ${res.status}`);
   return body;
@@ -765,6 +772,12 @@ window.addEventListener("resize", () => {
 
 const btnHeaderMenuEl = document.getElementById("btn-header-menu");
 
+// Populated once at load (see bottom of file) from /api/auth/me -- null
+// means GitHub sign-in isn't configured on this server at all, in which
+// case the menu just omits the sign-in row/Sign out button entirely rather
+// than showing a misleading "signed in as nobody" state.
+let currentGithubLogin = null;
+
 btnHeaderMenuEl.onclick = (ev) => {
   ev.stopPropagation();
   const alreadyOpen = btnHeaderMenuEl.classList.contains("menu-open");
@@ -776,9 +789,11 @@ btnHeaderMenuEl.onclick = (ev) => {
   const menu = document.createElement("div");
   menu.className = "card-menu header-menu";
   menu.innerHTML = `
+    ${currentGithubLogin ? `<div class="header-menu-account">Signed in as ${escapeHtml(currentGithubLogin)}</div>` : ""}
     <button data-action="theme">${isDark ? "☀ Switch to light mode" : "☾ Switch to dark mode"}</button>
     <button data-action="tools">Tools</button>
     <button data-action="restart" class="danger">Restart Server</button>
+    ${currentGithubLogin ? `<button data-action="signout" class="danger">Sign out</button>` : ""}
   `;
   menu.onclick = (mev) => {
     mev.stopPropagation();
@@ -788,9 +803,16 @@ btnHeaderMenuEl.onclick = (ev) => {
     if (action === "theme") toggleTheme();
     else if (action === "tools") showToolsView();
     else if (action === "restart") restartServer();
+    else if (action === "signout") window.location.href = "/auth/logout";
   };
   btnHeaderMenuEl.parentElement.appendChild(menu);
 };
+
+api("/api/auth/me")
+  .then((res) => {
+    currentGithubLogin = res.enabled ? res.login : null;
+  })
+  .catch(() => {});
 
 // ---------- notification bell (cross-project run completions) ----------
 // Polls for runs that finished anywhere, not just the project currently

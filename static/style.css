@@ -674,6 +674,14 @@ h1 {
 .card-menu button:hover { background: var(--brand-wash); color: var(--brand-deep); }
 .card-menu button.danger { color: var(--red); }
 .card-menu button.danger:hover { background: rgba(229, 72, 77, 0.1); color: var(--red); }
+.header-menu-account {
+  padding: 8px 15px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--muted);
+  border-bottom: 1px solid var(--border);
+  white-space: nowrap;
+}
 
 /* ---------- notification bell ---------- */
 

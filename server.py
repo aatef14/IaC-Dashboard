@@ -28,13 +28,15 @@ import io
 import json
 import mimetypes
 import os
+import urllib.parse
 
 import uvicorn
 from starlette.requests import Request
-from starlette.responses import FileResponse, JSONResponse, Response, StreamingResponse
+from starlette.responses import FileResponse, JSONResponse, RedirectResponse, Response, StreamingResponse
 from starlette.routing import WebSocketRoute
 from starlette.websockets import WebSocket, WebSocketDisconnect
 
+import auth as ghauth
 import run_manager as rm
 from mcp.server.mcpserver import MCPServer
 
@@ -542,6 +544,74 @@ async def vendor_asset(request: Request):
         return Response(status_code=404)
     media_type, _ = mimetypes.guess_type(full_path)
     return FileResponse(full_path, media_type=media_type or "application/octet-stream")
+
+
+# ===================================================================================
+# DASHBOARD -- GitHub sign-in
+# ===================================================================================
+# Entirely opt-in: without GITHUB_OAUTH_CLIENT_ID/SECRET set, these routes
+# still exist but AuthGateMiddleware below never redirects anyone to them --
+# the dashboard runs exactly as before. See README for setup.
+
+
+@server.custom_route("/auth/login", methods=["GET"])
+async def auth_login(request: Request):
+    if not ghauth.GITHUB_AUTH_ENABLED:
+        return JSONResponse({"error": "GitHub sign-in is not configured on this server"}, status_code=404)
+    redirect_uri = f"{request.url.scheme}://{request.headers['host']}/auth/callback"
+    state = ghauth.create_state_cookie_value()
+    resp = RedirectResponse(url=ghauth.github_authorize_url(redirect_uri, state))
+    resp.set_cookie(ghauth.STATE_COOKIE, state, max_age=ghauth.STATE_TTL_SECONDS, httponly=True, samesite="lax")
+    return resp
+
+
+@server.custom_route("/auth/callback", methods=["GET"])
+async def auth_callback(request: Request):
+    if not ghauth.GITHUB_AUTH_ENABLED:
+        return JSONResponse({"error": "GitHub sign-in is not configured on this server"}, status_code=404)
+    state_cookie = request.cookies.get(ghauth.STATE_COOKIE)
+    query_state = request.query_params.get("state")
+    if not ghauth.state_cookie_matches(state_cookie, query_state):
+        return JSONResponse({"error": "invalid or expired login attempt -- try signing in again"}, status_code=400)
+    code = request.query_params.get("code")
+    if not code:
+        return JSONResponse({"error": "GitHub did not return a code"}, status_code=400)
+
+    redirect_uri = f"{request.url.scheme}://{request.headers['host']}/auth/callback"
+    try:
+        access_token = await asyncio.to_thread(ghauth.exchange_code_for_token, code, redirect_uri)
+        if not access_token:
+            raise ValueError("no access_token in GitHub's response")
+        user = await asyncio.to_thread(ghauth.fetch_github_user, access_token)
+        login = user["login"]
+    except Exception as e:
+        return JSONResponse({"error": f"GitHub sign-in failed: {e}"}, status_code=502)
+
+    resp = RedirectResponse(url="/")
+    resp.set_cookie(
+        ghauth.SESSION_COOKIE,
+        ghauth.create_session_cookie_value(login),
+        max_age=ghauth.SESSION_TTL_SECONDS,
+        httponly=True,
+        samesite="lax",
+    )
+    resp.delete_cookie(ghauth.STATE_COOKIE)
+    return resp
+
+
+@server.custom_route("/auth/logout", methods=["GET", "POST"])
+async def auth_logout(request: Request):
+    resp = RedirectResponse(url="/auth/login" if ghauth.GITHUB_AUTH_ENABLED else "/")
+    resp.delete_cookie(ghauth.SESSION_COOKIE)
+    return resp
+
+
+@server.custom_route("/api/auth/me", methods=["GET"])
+async def api_auth_me(request: Request):
+    if not ghauth.GITHUB_AUTH_ENABLED:
+        return JSONResponse({"enabled": False, "login": None})
+    login = ghauth.read_session_cookie(request.cookies.get(ghauth.SESSION_COOKIE))
+    return JSONResponse({"enabled": True, "login": login})
 
 
 # ===================================================================================
@@ -1127,7 +1197,75 @@ async def terminal_ws(websocket: WebSocket):
 server._custom_starlette_routes.append(WebSocketRoute("/api/projects/{project_id}/terminal/ws", terminal_ws))
 
 
-app = server.streamable_http_app(host=HOST)
+# ===================================================================================
+# Auth gate -- wraps the whole ASGI app (not just custom_route handlers) so it
+# also covers the /mcp mount and the terminal websocket. Two independent,
+# both opt-in, checks:
+#   - /mcp*        -- MCP_SHARED_SECRET bearer token (see auth.py)
+#   - everything else -- GitHub session cookie, once GITHUB_OAUTH_CLIENT_ID/
+#     SECRET are configured; unauthenticated page loads get redirected to
+#     /auth/login, unauthenticated /api/* calls get a 401 JSON body instead
+#     (they're fetch() calls, not navigations, so a redirect would be silent
+#     and confusing), unauthenticated websocket connects just get closed.
+# ===================================================================================
+
+_PUBLIC_PATH_PREFIXES = ("/auth/", "/vendor/")
+_PUBLIC_PATHS = {"/style.css", "/app.js"}
+
+
+class AuthGateMiddleware:
+    def __init__(self, inner_app):
+        self.inner_app = inner_app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] not in ("http", "websocket"):
+            await self.inner_app(scope, receive, send)
+            return
+
+        path = scope["path"]
+        headers = dict(scope["headers"])
+
+        if path.startswith("/mcp"):
+            auth_header = headers.get(b"authorization", b"").decode()
+            if not ghauth.mcp_request_authorized(auth_header):
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 4401})
+                else:
+                    await JSONResponse({"error": "unauthorized"}, status_code=401)(scope, receive, send)
+                return
+            await self.inner_app(scope, receive, send)
+            return
+
+        if not ghauth.GITHUB_AUTH_ENABLED or path.startswith(_PUBLIC_PATH_PREFIXES) or path in _PUBLIC_PATHS:
+            await self.inner_app(scope, receive, send)
+            return
+
+        cookie_header = headers.get(b"cookie", b"").decode()
+        session_token = None
+        for part in cookie_header.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == ghauth.SESSION_COOKIE:
+                session_token = value
+                break
+        login = ghauth.read_session_cookie(session_token)
+
+        if login:
+            await self.inner_app(scope, receive, send)
+            return
+
+        if scope["type"] == "websocket":
+            await send({"type": "websocket.close", "code": 4401})
+            return
+
+        if path.startswith("/api/"):
+            await JSONResponse({"error": "not authenticated"}, status_code=401)(scope, receive, send)
+            return
+
+        next_param = urllib.parse.quote(path)
+        await RedirectResponse(url=f"/auth/login?next={next_param}")(scope, receive, send)
+
+
+app = AuthGateMiddleware(server.streamable_http_app(host=HOST))
 
 
 if __name__ == "__main__":
@@ -1135,4 +1273,12 @@ if __name__ == "__main__":
     print(f"IaC-Dashboard listening on http://{HOST}:{PORT}")
     print(f"  Dashboard:  http://{HOST}:{PORT}/")
     print(f"  MCP (HTTP): http://{HOST}:{PORT}/mcp")
+    if ghauth.GITHUB_AUTH_ENABLED:
+        print("  GitHub sign-in: ENABLED -- any GitHub account can sign in.")
+    else:
+        print("  GitHub sign-in: disabled (GITHUB_OAUTH_CLIENT_ID/SECRET not set) -- dashboard is open, no login.")
+    if ghauth.MCP_SHARED_SECRET:
+        print("  MCP endpoint: protected by shared secret.")
+    else:
+        print("  MCP endpoint: open (MCP_SHARED_SECRET not set).")
     uvicorn.run(app, host=HOST, port=PORT, log_level="info")

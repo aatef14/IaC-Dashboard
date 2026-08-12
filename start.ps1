@@ -4,6 +4,14 @@ $root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pidFile = Join-Path $root ".server.pid"
 $logFile = Join-Path $root "server.log"
 
+$secretsFile = Join-Path $root "secrets.local.ps1"
+if (Test-Path $secretsFile) {
+    # Sets $env:GITHUB_OAUTH_CLIENT_ID/SECRET and/or $env:MCP_SHARED_SECRET
+    # for this process, inherited by the python.exe child below -- see
+    # secrets.example.ps1. Git-ignored, so this is local-only.
+    . $secretsFile
+}
+
 if (Test-Path $pidFile) {
     $oldPid = Get-Content $pidFile -ErrorAction SilentlyContinue
     if ($oldPid) {

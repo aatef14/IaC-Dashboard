@@ -108,15 +108,16 @@ the layout in "Expected folder structure" -- this dashboard drives
 
 Binds to all network interfaces (`0.0.0.0`) by default, so it stays reachable
 at your machine's current LAN IP no matter which Wi-Fi/network you're on --
-`start.ps1` auto-detects and prints that IP every time it starts. **It has
-no authentication of its own** and can run real `terraform apply` calls
-against real cloud infrastructure, write to real files, and open a real
-shell -- so treat that LAN reachability as "anyone on this network can drive
-this dashboard," not just a convenience. If you want it restricted back to
-just this machine, set `$env:IAC_DASHBOARD_HOST = "127.0.0.1"` before
-running `.\start.ps1`. If several people need their own dashboard, each
-should run their own instance against their own Azure login rather than
-sharing one.
+`start.ps1` auto-detects and prints that IP every time it starts. **By
+default it has no authentication of its own** and can run real `terraform
+apply` calls against real cloud infrastructure, write to real files, and
+open a real shell -- so treat that LAN reachability as "anyone on this
+network can drive this dashboard," not just a convenience, unless you've set
+up GitHub sign-in (see **GitHub sign-in** below). If you want it restricted
+back to just this machine instead, set `$env:IAC_DASHBOARD_HOST =
+"127.0.0.1"` before running `.\start.ps1`. If several people need their own
+dashboard, each should run their own instance against their own Azure login
+rather than sharing one.
 
 ## Starting / stopping
 
@@ -130,6 +131,53 @@ opens your default browser to it automatically.
 
 Logs land in `server.log` / `server.log.err` in this folder. To run it in the
 foreground instead (e.g. while debugging): `python server.py`.
+
+## GitHub sign-in (optional)
+
+Off by default -- the dashboard runs exactly as it always has (open, no
+login) until you configure this. Worth turning on once you're sharing your
+LAN IP with anyone else, since that otherwise means anyone on the network
+can drive real Terraform runs with zero login at all.
+
+1. Create a GitHub OAuth App: **github.com -> Settings -> Developer settings
+   -> OAuth Apps -> New OAuth App**.
+   - Homepage URL: `http://<the host/IP you access the dashboard at>:8765/`
+   - Authorization callback URL: same, with `/auth/callback` --
+     e.g. `http://192.168.1.23:8765/auth/callback`. This has to be an exact
+     match, so if your LAN IP changes (a different Wi-Fi network), update
+     this field to match before signing in from that network.
+   - Generate a Client Secret, note both it and the Client ID.
+2. Copy `secrets.example.ps1` to `secrets.local.ps1` (git-ignored -- stays
+   local to this machine) and fill in `GITHUB_OAUTH_CLIENT_ID` /
+   `GITHUB_OAUTH_CLIENT_SECRET`. `start.ps1` picks it up automatically on
+   every future start, no need to set env vars by hand each time.
+3. `.\stop.ps1` then `.\start.ps1` (or just re-run `install.ps1`).
+
+Once configured, any GitHub account can sign in -- there's no allowlist, so
+anyone who reaches the dashboard's URL and has a GitHub account gets in
+after authenticating. Signed-in users appear in the header menu (top-right
+&#9776;), which also has **Sign out**.
+
+The MCP endpoint (`/mcp`, used by Claude Code) is separate from this --
+GitHub's OAuth flow doesn't fit a non-browser MCP client. If you want it
+protected too, set `MCP_SHARED_SECRET` in the same `secrets.local.ps1` to
+any random string, then add a matching header to the `.mcp.json` in
+whichever repo connects to it:
+
+```json
+{
+  "mcpServers": {
+    "IaC-Dashboard": {
+      "type": "http",
+      "url": "http://127.0.0.1:8765/mcp",
+      "headers": { "Authorization": "Bearer <the same random string>" }
+    }
+  }
+}
+```
+
+Leaving `MCP_SHARED_SECRET` unset keeps `/mcp` open, independent of whether
+GitHub sign-in is configured for the web dashboard.
 
 ## Running with Docker
 
@@ -303,6 +351,8 @@ ever be a human clicking a button, never an agent deciding to do it.
 | File | Purpose |
 |---|---|
 | `server.py` | FastAPI/Starlette app -- MCP tools + dashboard REST/SSE routes, single process |
+| `auth.py` | Optional GitHub OAuth sign-in for the web dashboard (HMAC-signed session cookies) + the separate MCP shared-secret check -- both no-ops until configured, see **GitHub sign-in** |
+| `secrets.example.ps1` | Template for `secrets.local.ps1` (git-ignored) -- GitHub OAuth Client ID/Secret and the MCP shared secret, auto-loaded by `start.ps1` |
 | `run_manager.py` | Core logic: organization/project CRUD, folder scaffolding, cloud-auth pre-flight check, init/fmt/validate/plan/apply execution, confirmation tokens, the one-run-at-a-time-per-project lock |
 | `run_store.py` | SQLite persistence for run history (`runs.db`) -- write-through on every run, reloaded at startup |
 | `organizations.json` | Saved Organizations (name) -- every project belongs to one |
