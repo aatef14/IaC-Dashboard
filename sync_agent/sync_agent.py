@@ -31,9 +31,28 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+
+class _Server(ThreadingHTTPServer):
+    # socketserver.TCPServer sets allow_reuse_address = True by default --
+    # on Windows specifically, SO_REUSEADDR lets a COMPLETELY SEPARATE
+    # process bind the same port an existing listener is already actively
+    # using, with no error at all (unlike POSIX, where it mainly just
+    # allows rebinding a socket still in TIME_WAIT). Two orphaned
+    # instances ended up genuinely running at once this way, each with
+    # its own token, with incoming requests randomly routed to whichever
+    # one the OS happened to pick -- which looked exactly like "the token
+    # is wrong" for whichever one lost that particular request. Disabling
+    # this restores the intended behavior: a second instance's bind
+    # attempt actually fails, so main() can show its "already running?"
+    # error instead of silently starting a second, conflicting server.
+    allow_reuse_address = False
+
+
 PORT = 9876
+AUTO_SYNC_INTERVAL_SECONDS = 5 * 60
 CONFIG_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "IaCDashboardSyncAgent")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 
@@ -94,6 +113,48 @@ def _run_git(args, cwd, timeout=120) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout
+
+
+def _do_sync() -> dict | None:
+    """The actual pull-then-push-if-anything-changed logic -- shared by
+    the /sync endpoint (a manual "sync right now") and the periodic
+    background loop below (a quiet "sync every few minutes" so the button
+    isn't the only thing that makes this a sync AGENT rather than a
+    sync-on-demand tool). Returns None if not configured yet; otherwise
+    {"pushed": bool, "warning": str | None}."""
+    cfg = _load_config()
+    local_dir = cfg.get("local_dir")
+    if not local_dir:
+        return None
+    warning = None
+    try:
+        _run_git(["pull", "--ff-only"], cwd=local_dir)
+    except RuntimeError as e:
+        warning = str(e)
+    _run_git(["add", "-A"], cwd=local_dir)
+    status = _run_git(["status", "--porcelain"], cwd=local_dir)
+    pushed = False
+    if status.strip():
+        _run_git(["commit", "-m", "Synced from IaC-Dashboard Sync Agent"], cwd=local_dir)
+        _run_git(["push"], cwd=local_dir)
+        pushed = True
+    cfg["last_synced_at"] = time.time()
+    _save_config(cfg)
+    return {"pushed": pushed, "warning": warning}
+
+
+def _auto_sync_loop():
+    """Runs for the agent's whole lifetime -- sleeps, then syncs if
+    configured, forever. Silent on success/expected failures (a pull
+    conflict, no network) since this is meant to be unattended; if you
+    need to SEE the result, that's what the dashboard's manual "Sync to my
+    computer" button and its toast are for."""
+    while True:
+        time.sleep(AUTO_SYNC_INTERVAL_SECONDS)
+        try:
+            _do_sync()
+        except Exception:
+            pass  # next tick tries again -- one bad sync shouldn't kill the whole loop
 
 
 # Tkinter/Tcl is not thread-safe -- creating a fresh Tk() from whatever
@@ -218,6 +279,7 @@ class Handler(BaseHTTPRequestHandler):
                     "repo_url": cfg.get("repo_url"),
                     "local_dir": cfg.get("local_dir"),
                     "last_synced_at": cfg.get("last_synced_at"),
+                    "auto_sync_interval_seconds": AUTO_SYNC_INTERVAL_SECONDS,
                 },
             )
             return
@@ -251,28 +313,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if self.path == "/sync":
-                cfg = _load_config()
-                local_dir = cfg.get("local_dir")
-                if not local_dir:
+                result = _do_sync()
+                if result is None:
                     self._send_json(400, {"error": "not configured yet -- call /configure first"})
                     return
-                warning = None
-                try:
-                    _run_git(["pull", "--ff-only"], cwd=local_dir)
-                except RuntimeError as e:
-                    warning = str(e)
-                _run_git(["add", "-A"], cwd=local_dir)
-                status = _run_git(["status", "--porcelain"], cwd=local_dir)
-                pushed = False
-                if status.strip():
-                    _run_git(["commit", "-m", "Synced from IaC-Dashboard Sync Agent"], cwd=local_dir)
-                    _run_git(["push"], cwd=local_dir)
-                    pushed = True
-                import time
-
-                cfg["last_synced_at"] = time.time()
-                _save_config(cfg)
-                self._send_json(200, {"ok": True, "pushed": pushed, "warning": warning})
+                self._send_json(200, {"ok": True, **result})
                 return
 
             self._send_json(404, {"error": "not found"})
@@ -408,7 +453,7 @@ def main():
     copied = _copy_to_clipboard(TOKEN)
 
     try:
-        server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+        server = _Server(("127.0.0.1", PORT), Handler)
     except OSError as e:
         _show_message(
             "IaC-Dashboard Sync Agent -- could not start",
@@ -421,6 +466,7 @@ def main():
     # actually dismisses that informational popup.
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
+    threading.Thread(target=_auto_sync_loop, daemon=True).start()
 
     if is_first_run:
         _show_message(

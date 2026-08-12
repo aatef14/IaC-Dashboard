@@ -32,12 +32,14 @@ this at all; the dashboard already does its own git syncing server-side.
 4. On the dashboard website, open the Cloud org you want to sync -- there's
    a "Local Sync Agent" panel. Paste the token, click **Browse...** to pick
    a local folder, then **Start Syncing**. It clones the org's repo there.
-5. From then on, click **Sync to my computer** any time to pull the latest
-   and push whatever local changes exist.
+5. From then on, it **auto-syncs every ~5 minutes** in the background on
+   its own -- pulls the latest and pushes anything changed locally, quietly
+   (no popup unless you use the manual button). Click **Sync to my
+   computer** any time you don't want to wait for the next tick.
 
 Requires `git` on PATH on your machine (same as the main dashboard). To
-stop it, right-click its tray icon and choose **Quit** -- "Sync to my
-computer" just won't do anything until you run it again.
+stop it, right-click its tray icon and choose **Quit** -- both auto-sync
+and "Sync to my computer" stop working until you run it again.
 
 ## Building the .exe yourself
 
@@ -70,6 +72,20 @@ way to stop it besides Task Manager.
 - `GET /status` has no token requirement (it reveals no secrets -- just
   whether it's configured and for which repo), so the dashboard can show
   "agent detected" without needing the token first.
+
+## A note on running two copies at once
+
+Python's `http.server` sets `allow_reuse_address = True` by default, and
+on Windows specifically `SO_REUSEADDR` lets a completely separate process
+bind the same port an already-running instance is using, with no error --
+unlike POSIX, where it mainly just permits rebinding a socket still in
+TIME_WAIT. Without disabling that, two copies (e.g. auto-start-at-login
+racing a manual double-click) could both end up genuinely running at once,
+each with its own token, with incoming requests randomly routed to
+whichever one the OS happened to pick -- which looks exactly like "the
+token is wrong," for whichever one loses a given request. This is
+disabled here specifically so a second copy's bind attempt actually fails
+instead of silently creating a second, conflicting server.
 
 ## A note on tkinter and threads
 

@@ -689,9 +689,11 @@ async function renderLocalSyncPanel(org) {
   }
 
   const lastSynced = status.last_synced_at ? fmtRelative(status.last_synced_at) : "never";
+  const autoSyncMins = status.auto_sync_interval_seconds ? Math.round(status.auto_sync_interval_seconds / 60) : null;
   localSyncPanelEl.innerHTML = `
     <div class="local-sync-box">
-      <span class="muted">Synced to <code>${escapeHtml(status.local_dir)}</code> on this computer. Last synced: ${escapeHtml(lastSynced)}.</span>
+      <span class="muted">Synced to <code>${escapeHtml(status.local_dir)}</code> on this computer. Last synced: ${escapeHtml(lastSynced)}.
+        ${autoSyncMins ? `Auto-syncs every ~${autoSyncMins} min in the background.` : ""}</span>
       <button id="btn-sync-to-computer" class="btn">&#8635; Sync to my computer</button>
     </div>`;
   document.getElementById("btn-sync-to-computer").onclick = async () => {
