@@ -51,6 +51,10 @@ else:
     import ptyprocess as _pty_backend
     import signal
 
+# subprocess.CREATE_NO_WINDOW doesn't exist on POSIX -- 0 is a no-op flag
+# there, so this stays cross-platform without an os.name check at every call site.
+_NO_WINDOW_FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+
 CONFIRMATION_TTL_SECONDS = 10 * 60
 PLAN_FILE_TTL_SECONDS = 30 * 60
 
@@ -257,7 +261,14 @@ def _cloud_repo_dir(org_id: str) -> str:
 
 def _run_git(args: list[str], cwd: str, timeout: int = 60) -> str:
     git_exe = _resolve_executable("git")
-    result = subprocess.run([git_exe, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    # CREATE_NO_WINDOW -- without it, every git call flashes a new console
+    # window on Windows (visible even though output is captured, since it's
+    # about window allocation, not stream inheritance). Cloud-org sync runs
+    # this on a poll/every editor-open, so left unset it read as a
+    # distracting flicker rather than one-off noise.
+    result = subprocess.run(
+        [git_exe, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout, creationflags=_NO_WINDOW_FLAGS
+    )
     if result.returncode != 0:
         raise ValueError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout
@@ -266,7 +277,9 @@ def _run_git(args: list[str], cwd: str, timeout: int = 60) -> str:
 def _clone_cloud_repo(repo_url: str, repo_dir: str):
     os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
     git_exe = _resolve_executable("git")
-    result = subprocess.run([git_exe, "clone", repo_url, repo_dir], capture_output=True, text=True, timeout=120)
+    result = subprocess.run(
+        [git_exe, "clone", repo_url, repo_dir], capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW_FLAGS
+    )
     if result.returncode != 0:
         raise ValueError(f"could not clone '{repo_url}': {result.stderr.strip() or result.stdout.strip()}")
 
@@ -425,32 +438,29 @@ def sync_cloud_org(org_id: str) -> dict:
     return {"pulled": pulled, "warning": warning}
 
 
-def create_cloud_project(org_id: str, name: str, retention_days: int | None = None) -> dict:
-    """The Cloud-org fast path for Add Work Project: name it, and the
-    dashboard scaffolds <repo>/<name>/ (modules/ + tf-deployment/)
-    automatically -- no folder picker, no "select existing folder" option.
-    Always a fresh scaffold (REPLACE_ME placeholders you still fill in
-    yourself before terraform init/plan will actually work) -- same as
-    "Initialize new folder" has always been, this just skips choosing
-    WHERE, since for a Cloud org there's only ever one right answer."""
+def list_cloud_repo_folders(org_id: str) -> list[str]:
+    """Top-level folder names already inside a Cloud org's cloned repo --
+    what "Select existing folder" offers to pick from. Deliberately just
+    names, not paths: the absolute local_repo_path is specific to whichever
+    machine happens to have this particular clone, so showing it (or asking
+    someone to Browse to it) is meaningless to anyone but that one machine.
+    A relative name is the only part that's actually shared/meaningful --
+    it's the same thing _manifest_entry_for already reduces project_root
+    to before pushing."""
     org = get_org(org_id)
     if org is None:
-        raise ValueError("unknown org_id -- create an organization first")
+        raise ValueError("unknown org_id")
     if org.get("mode") != "cloud":
-        raise ValueError("create_cloud_project is only for Cloud organizations")
-
-    name = _validate_name(name, "project")
-    if name in (".", "..") or "/" in name or "\\" in name:
-        raise ValueError("project name can't contain '/' or '\\\\' -- it's used directly as the folder name in the repo")
-
-    project_root = os.path.join(org["local_repo_path"], name)
-    if os.path.exists(project_root):
-        raise ValueError(f"'{name}' already exists in this repo -- pick a different name")
-
-    os.makedirs(project_root)
-    discovered = initialize_project_folder(project_root)
-    dep = discovered["deployments"][0]
-    return add_project(org_id, name, project_root, dep["name"], dep["environments"][0], retention_days=retention_days)
+        raise ValueError("list_cloud_repo_folders is only for Cloud organizations")
+    repo_root = org["local_repo_path"]
+    if not os.path.isdir(repo_root):
+        return []
+    skip = {".git", ".iac-dashboard"}
+    return sorted(
+        name
+        for name in os.listdir(repo_root)
+        if name not in skip and os.path.isdir(os.path.join(repo_root, name))
+    )
 
 
 def check_project_root_for_org(org_id: str, project_root: str):
@@ -639,10 +649,14 @@ def initialize_project_folder(project_root: str) -> dict:
     an existing folder -- you still need to replace the REPLACE_ME
     placeholders with real values before init will actually succeed).
     Refuses a non-empty folder -- "select existing folder" is the flow for
-    anything already populated."""
+    anything already populated. Creates the folder itself if it doesn't
+    exist yet (rather than requiring it be pre-created) -- lets a Cloud
+    org's "Initialize new folder" work from just a name, no local folder
+    to have created first."""
     project_root = os.path.normpath(project_root)
-    if not os.path.isdir(project_root):
-        raise ValueError(f"'{project_root}' is not a directory")
+    if os.path.exists(project_root) and not os.path.isdir(project_root):
+        raise ValueError(f"'{project_root}' exists and is not a directory")
+    os.makedirs(project_root, exist_ok=True)
     if os.listdir(project_root):
         raise ValueError(
             f"'{project_root}' is not empty -- pick an empty folder to initialize, "
@@ -833,6 +847,18 @@ def remove_project(project_id: str):
         if org and org.get("mode") == "cloud":
             try:
                 _remove_manifest_entry(org, project["name"])
+                # Deleting a Cloud-org project also deletes its folder from
+                # the shared repo (and pushes that removal) -- leaving the
+                # files behind while only dropping the manifest entry meant
+                # "delete project" didn't actually mean gone: the folder
+                # would keep existing for everyone who syncs, just untracked
+                # by the dashboard. Scoped to inside the repo (always true
+                # for how these get created) so this can never reach outside
+                # the clone.
+                project_root = os.path.normpath(project["project_root"])
+                repo_root = os.path.normpath(org["local_repo_path"])
+                if os.path.commonpath([repo_root, project_root]) == repo_root and os.path.isdir(project_root):
+                    shutil.rmtree(project_root, ignore_errors=True)
                 _git_commit_and_push(org, f"Remove project '{project['name']}'")
             except Exception:
                 pass  # best-effort -- a push failure here shouldn't block the local delete that already happened

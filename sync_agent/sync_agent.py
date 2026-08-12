@@ -122,7 +122,20 @@ def _resolve_git() -> str:
 
 
 def _run_git(args, cwd, timeout=120) -> str:
-    result = subprocess.run([_resolve_git(), *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    # CREATE_NO_WINDOW -- without it, every git call (each pull/status/
+    # commit/push, whether from a manual "Sync now" click or the 5-minute
+    # auto-sync loop) flashes a new console window on screen even though
+    # this agent itself is a --noconsole build with output already
+    # captured; the flash is about window allocation, not stream
+    # inheritance, so redirecting stdout/stderr alone doesn't stop it.
+    result = subprocess.run(
+        [_resolve_git(), *args],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        creationflags=subprocess.CREATE_NO_WINDOW,
+    )
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout

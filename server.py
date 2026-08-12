@@ -1105,24 +1105,6 @@ async def api_delete_org(request: Request):
     return JSONResponse({"ok": True})
 
 
-@server.custom_route("/api/organizations/{org_id}/cloud-project", methods=["POST"])
-async def api_create_cloud_project(request: Request):
-    """The Cloud-org fast path: name only, no project_root/deployment/
-    environment -- see rm.create_cloud_project."""
-    body, err = await _json_body(request)
-    if err:
-        return err
-    if "name" not in body:
-        return JSONResponse({"error": "missing 'name'"}, status_code=400)
-    try:
-        project = await asyncio.to_thread(
-            rm.create_cloud_project, request.path_params["org_id"], body["name"], body.get("retention_days")
-        )
-        return JSONResponse(project)
-    except ValueError as e:
-        return JSONResponse({"error": str(e)}, status_code=400)
-
-
 @server.custom_route("/api/organizations/{org_id}/sync", methods=["POST"])
 async def api_sync_org(request: Request):
     """Pull the latest from a Cloud org's repo and pick up any new projects
@@ -1131,6 +1113,21 @@ async def api_sync_org(request: Request):
     try:
         result = await asyncio.to_thread(rm.sync_cloud_org, request.path_params["org_id"])
         return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/organizations/{org_id}/repo-folders", methods=["GET"])
+async def api_list_cloud_repo_folders(request: Request):
+    """Names of top-level folders already in a Cloud org's repo -- what the
+    "Select existing folder" tab offers for Add Work Project, instead of a
+    local-path Browse dialog that means nothing to anyone but this machine.
+    Syncs first so it reflects whatever anyone else most recently pushed."""
+    org_id = request.path_params["org_id"]
+    try:
+        await asyncio.to_thread(rm.sync_cloud_org, org_id)
+        folders = await asyncio.to_thread(rm.list_cloud_repo_folders, org_id)
+        return JSONResponse(folders)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

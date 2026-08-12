@@ -20,7 +20,6 @@ const projectsGridEl = document.getElementById("projects-grid");
 const noProjectsMsgEl = document.getElementById("no-projects-msg");
 const btnHowToUseEl = document.getElementById("btn-how-to-use");
 const btnAddProjectEl = document.getElementById("btn-add-project");
-const btnSyncCloudOrgEl = document.getElementById("btn-sync-cloud-org");
 
 const modalOverlayEl = document.getElementById("modal-overlay");
 const howToUseModalEl = document.getElementById("how-to-use-modal");
@@ -43,6 +42,9 @@ const tabExistingFolderEl = document.getElementById("tab-existing-folder");
 const tabNewFolderEl = document.getElementById("tab-new-folder");
 const projectRootLabelEl = document.getElementById("project-root-label");
 const projectRootInputEl = document.getElementById("project-root-input");
+const localFolderRowEl = document.getElementById("local-folder-row");
+const cloudExistingFolderSelectEl = document.getElementById("cloud-existing-folder-select");
+const cloudNewFolderNameInputEl = document.getElementById("cloud-new-folder-name-input");
 const btnBrowseEl = document.getElementById("btn-browse");
 const btnScanEl = document.getElementById("btn-scan");
 const btnInitializeFolderEl = document.getElementById("btn-initialize-folder");
@@ -554,10 +556,12 @@ function showToolsView({ pushHistory = true } = {}) {
 
 // ---------- org view (work projects inside one organization) ----------
 
-// Shared between the automatic sync-on-open (showOrgView) and the manual
-// "Sync now" button -- same call, same error handling either way. No-op
-// server-side for a Local org. Best-effort -- a pull failure (no network,
-// no credentials) is surfaced as a toast, not a blocking error, since
+// Runs automatically every time a Cloud org's page is opened
+// (showOrgView) and every time the in-app editor lists a project's files
+// -- there's no manual "Sync now" button because there's nothing it would
+// do that isn't already covered by just opening the org. No-op server-side
+// for a Local org. Best-effort -- a pull failure (no network, no
+// credentials) is surfaced as a toast, not a blocking error, since
 // whatever synced previously is still viewable.
 async function syncCloudOrg(org) {
   if (org.mode !== "cloud") return;
@@ -568,18 +572,6 @@ async function syncCloudOrg(org) {
     toast(`Cloud sync failed: ${e.message}`, { type: "warning", duration: 7000 });
   }
 }
-
-btnSyncCloudOrgEl.onclick = async () => {
-  if (!currentOrg) return;
-  btnSyncCloudOrgEl.disabled = true;
-  try {
-    await syncCloudOrg(currentOrg);
-    await refreshProjects();
-    toast("Synced.", { type: "success", duration: 2500 });
-  } finally {
-    btnSyncCloudOrgEl.disabled = false;
-  }
-};
 
 // ---------- local sync agent ("Sync to my computer") ----------
 // Talks DIRECTLY to a small local program (IaC-Dashboard Sync Agent)
@@ -598,6 +590,22 @@ btnSyncCloudOrgEl.onclick = async () => {
 
 const AGENT_URL = "http://127.0.0.1:9876";
 const localSyncPillEl = document.getElementById("local-sync-pill");
+const localSyncWrapEl = document.getElementById("local-sync-wrap");
+const btnUpdateAgentEl = document.getElementById("btn-update-agent");
+let agentDetectedForUpdate = false; // set by renderLocalSyncPill -- no point offering "Update" for an agent that isn't even running
+
+localSyncWrapEl.addEventListener("mouseenter", () => {
+  btnUpdateAgentEl.classList.toggle("hidden", !agentDetectedForUpdate);
+});
+localSyncWrapEl.addEventListener("mouseleave", () => btnUpdateAgentEl.classList.add("hidden"));
+btnUpdateAgentEl.onclick = (ev) => {
+  ev.stopPropagation(); // sibling of the pill inside the same hover group -- don't also fire the pill's own click (sync/setup)
+  window.location.href = "/download/sync-agent";
+  toast(
+    "Downloading the latest Sync Agent. Quit the running one (right-click its tray icon) and run the new file -- your token and folder stay configured, nothing to re-enter.",
+    { type: "info", duration: 8000 }
+  );
+};
 const agentConfigureModalEl = document.getElementById("agent-configure-modal");
 const agentConfigureRepoLabelEl = document.getElementById("agent-configure-repo-label");
 const agentConfigureDefaultPathEl = document.getElementById("agent-configure-default-path");
@@ -632,6 +640,7 @@ async function agentFetch(path, opts = {}) {
 async function renderLocalSyncPill(org) {
   if (org.mode !== "cloud") {
     localSyncPillEl.classList.add("hidden");
+    agentDetectedForUpdate = false;
     return;
   }
   localSyncPillEl.classList.remove("hidden");
@@ -641,7 +650,9 @@ async function renderLocalSyncPill(org) {
     status = await agentFetch("/status");
   } catch (e) {
     // Most common case: the agent just isn't running right now -- not an
-    // error to alarm over, just an offer to get it.
+    // error to alarm over, just an offer to get it. Nothing to "update"
+    // if there's no agent detected in the first place.
+    agentDetectedForUpdate = false;
     localSyncPillEl.className = "pill muted-pill";
     localSyncPillEl.textContent = "Local sync: not running";
     localSyncPillEl.dataset.tip = [
@@ -654,6 +665,8 @@ async function renderLocalSyncPill(org) {
     };
     return;
   }
+
+  agentDetectedForUpdate = true;
 
   const configuredForThisOrg = status.configured && status.repo_url === org.repo_url;
 
@@ -776,7 +789,6 @@ async function showOrgView(org, { pushHistory = true } = {}) {
   btnBackEl.textContent = "←";
   orgViewNameEl.textContent = org.name;
   document.title = `${org.name} — IaC-Dashboard`;
-  btnSyncCloudOrgEl.classList.toggle("hidden", org.mode !== "cloud");
 
   if (pushHistory) {
     const url = `/${encodeURIComponent(org.name)}`;
@@ -1339,8 +1351,11 @@ function renderProjectCard(p) {
           toast(`Could not clear runs: ${e.message}`, { type: "error" });
         }
       } else if (action === "delete") {
+        const isCloudProject = currentOrg && currentOrg.mode === "cloud";
         const ok = await confirmDialog(
-          `Delete "${p.name}" from the dashboard?\n\nThis only removes it from this list -- it does NOT run terraform destroy or touch any Azure resources.`,
+          isCloudProject
+            ? `Delete "${p.name}"?\n\nThis removes it from the dashboard AND deletes its folder from the shared repo (pushed immediately) -- it does NOT run terraform destroy or touch any Azure resources.`
+            : `Delete "${p.name}" from the dashboard?\n\nThis only removes it from this list -- it does NOT run terraform destroy or touch any Azure resources.`,
           { title: "Delete project?", okLabel: "Delete project" }
         );
         if (!ok) return;
@@ -1478,11 +1493,30 @@ btnCreateOrgEl.onclick = async () => {
 const addProjectModalTitleEl = document.getElementById("add-project-modal-title");
 let editingProjectId = null; // null = "add" mode, otherwise the project.id being edited
 
+// Whether the modal is in its "add" (not edit) flow for a Cloud org --
+// only then does the folder question become "which name in the repo", not
+// "which path on this disk". Editing an already-saved project still shows
+// its real local_repo_path-relative path (see openEditProjectModal) since
+// at that point it's a concrete value worth being able to see/troubleshoot,
+// not a decision to make from scratch.
+let addingCloudProject = false;
+
 function setFolderMode(mode) {
   addProjectMode = mode;
   tabExistingFolderEl.classList.toggle("active", mode === "existing");
   tabNewFolderEl.classList.toggle("active", mode === "new");
-  projectRootLabelEl.textContent = mode === "new" ? "Empty folder to initialize" : "Project folder";
+  if (addingCloudProject) {
+    projectRootLabelEl.textContent = mode === "new" ? "New folder name" : "Existing folder in the repo";
+    localFolderRowEl.classList.add("hidden");
+    cloudExistingFolderSelectEl.classList.toggle("hidden", mode !== "existing");
+    cloudNewFolderNameInputEl.classList.toggle("hidden", mode !== "new");
+    if (mode === "existing") loadCloudRepoFolders();
+  } else {
+    projectRootLabelEl.textContent = mode === "new" ? "Empty folder to initialize" : "Project folder";
+    localFolderRowEl.classList.remove("hidden");
+    cloudExistingFolderSelectEl.classList.add("hidden");
+    cloudNewFolderNameInputEl.classList.add("hidden");
+  }
   newFolderHintEl.classList.toggle("hidden", mode !== "new");
   btnScanEl.classList.toggle("hidden", mode !== "existing");
   btnInitializeFolderEl.classList.toggle("hidden", mode !== "new");
@@ -1494,11 +1528,37 @@ function setFolderMode(mode) {
 tabExistingFolderEl.onclick = () => setFolderMode("existing");
 tabNewFolderEl.onclick = () => setFolderMode("new");
 
-// Cloud org project creation skips the folder picker entirely -- name it,
-// and create_cloud_project scaffolds <repo>/<name>/ automatically (see
-// README's "Cloud organizations" section for why: the folder is never a
-// real choice for a Cloud org, there's exactly one right answer).
-let isCloudCreateMode = false;
+// Populates the "Select existing folder" dropdown for a Cloud org from
+// what's actually in the repo right now (server syncs first) -- names
+// only, no local path, since the path is specific to whichever machine
+// happens to have this clone.
+async function loadCloudRepoFolders() {
+  cloudExistingFolderSelectEl.innerHTML = `<option value="">Loading…</option>`;
+  cloudExistingFolderSelectEl.disabled = true;
+  try {
+    const folders = await api(`/api/organizations/${currentOrg.id}/repo-folders`);
+    cloudExistingFolderSelectEl.innerHTML = folders.length
+      ? `<option value="">Choose a folder…</option>` + folders.map((f) => `<option value="${escapeHtml(f)}">${escapeHtml(f)}</option>`).join("")
+      : `<option value="">No existing folders in this repo yet</option>`;
+  } catch (e) {
+    cloudExistingFolderSelectEl.innerHTML = `<option value="">Could not load folders</option>`;
+    showAddProjectError(e.message);
+  } finally {
+    cloudExistingFolderSelectEl.disabled = false;
+  }
+}
+cloudExistingFolderSelectEl.onchange = () => {
+  deploymentSelectBoxEl.classList.add("hidden");
+  btnCreateProjectEl.disabled = true;
+};
+
+// The full local path a Cloud org's chosen repo-relative name resolves to
+// on THIS machine -- built client-side only to hand to the existing
+// discover/initialize/add endpoints, which still work in terms of real
+// paths; the user never sees or types this absolute path themselves.
+function cloudProjectRoot(name) {
+  return `${currentOrg.local_repo_path}/${name}`;
+}
 
 btnAddProjectEl.onclick = () => {
   editingProjectId = null;
@@ -1509,35 +1569,27 @@ btnAddProjectEl.onclick = () => {
   projectNameInputEl.title = "";
   retentionDaysInputEl.value = "";
   addProjectErrorEl.classList.add("hidden");
+  cloudNewFolderNameInputEl.value = "";
+  resolvedProjectRoot = null;
 
-  isCloudCreateMode = !!(currentOrg && currentOrg.mode === "cloud");
-  cloudProjectHintEl.classList.toggle("hidden", !isCloudCreateMode);
-  folderPickerSectionEl.classList.toggle("hidden", isCloudCreateMode);
+  addingCloudProject = !!(currentOrg && currentOrg.mode === "cloud");
+  cloudProjectHintEl.classList.toggle("hidden", !addingCloudProject);
+  folderPickerSectionEl.classList.remove("hidden");
+  // Pre-fills from this org's last-browsed path (Local orgs only -- see
+  // btnBrowseEl.onclick) instead of always starting blank, most useful
+  // when an org's projects live under one shared parent folder.
+  projectRootInputEl.value = (!addingCloudProject && currentOrg && currentOrg.last_browsed_path) || "";
+  tabExistingFolderEl.classList.remove("hidden");
+  tabNewFolderEl.classList.remove("hidden");
+  document.getElementById("folder-mode-tabs").classList.remove("hidden");
+  setFolderMode("existing");
 
-  if (isCloudCreateMode) {
-    btnCreateProjectEl.disabled = true; // re-enabled by the name-input listener below once non-empty
-  } else {
-    // Pre-fills from this org's last-browsed path (see btnBrowseEl.onclick)
-    // instead of always starting blank -- most useful when an org's
-    // projects live under one shared parent repo/client folder.
-    projectRootInputEl.value = (currentOrg && currentOrg.last_browsed_path) || "";
-    tabExistingFolderEl.classList.remove("hidden");
-    tabNewFolderEl.classList.remove("hidden");
-    document.getElementById("folder-mode-tabs").classList.remove("hidden");
-    setFolderMode("existing");
-  }
   openModal(addProjectModalEl);
 };
 
-projectNameInputEl.addEventListener("input", () => {
-  if (isCloudCreateMode && !editingProjectId) {
-    btnCreateProjectEl.disabled = !projectNameInputEl.value.trim();
-  }
-});
-
 async function openEditProjectModal(project) {
   editingProjectId = project.id;
-  isCloudCreateMode = false; // editing always uses the full folder picker, even for a Cloud org project
+  addingCloudProject = false; // editing always shows the real local path, even for a Cloud org project
   cloudProjectHintEl.classList.add("hidden");
   folderPickerSectionEl.classList.remove("hidden");
   addProjectModalTitleEl.textContent = `Edit "${project.name}"`;
@@ -1594,16 +1646,30 @@ btnBrowseEl.onclick = async () => {
   }
 };
 
+// The path to actually send to discover/initialize/add -- a real local
+// path (Browse/typed) for Local orgs, or a name-derived path built from
+// the Cloud org's repo root for Cloud orgs (see cloudProjectRoot). Resolved
+// once at Scan/Initialize time and reused at Create time rather than
+// re-read from the input then, so a stray edit in between can't silently
+// create the project somewhere other than what was just scanned.
+function currentProjectRootInput() {
+  if (!addingCloudProject) return projectRootInputEl.value.trim();
+  return addProjectMode === "new" ? cloudNewFolderNameInputEl.value.trim() : cloudExistingFolderSelectEl.value;
+}
+let resolvedProjectRoot = null;
+
 btnScanEl.onclick = async () => {
   addProjectErrorEl.classList.add("hidden");
-  const projectRoot = projectRootInputEl.value.trim();
-  if (!projectRoot) { showAddProjectError("Enter or browse to a folder first."); return; }
+  const rawInput = currentProjectRootInput();
+  if (!rawInput) { showAddProjectError(addingCloudProject ? "Choose a folder first." : "Enter or browse to a folder first."); return; }
+  const projectRoot = addingCloudProject ? cloudProjectRoot(rawInput) : rawInput;
   try {
     const result = await api("/api/project/discover", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project_root: projectRoot }),
     });
+    resolvedProjectRoot = result.project_root;
     discoveredDeployments = result.deployments;
     deploymentSelectEl.innerHTML = discoveredDeployments
       .map((d) => `<option value="${d.name}">${d.name}</option>`)
@@ -1620,14 +1686,16 @@ btnScanEl.onclick = async () => {
 
 btnInitializeFolderEl.onclick = async () => {
   addProjectErrorEl.classList.add("hidden");
-  const projectRoot = projectRootInputEl.value.trim();
-  if (!projectRoot) { showAddProjectError("Enter or browse to an empty folder first."); return; }
+  const rawInput = currentProjectRootInput();
+  if (!rawInput) { showAddProjectError(addingCloudProject ? "Give the new folder a name first." : "Enter or browse to an empty folder first."); return; }
+  const projectRoot = addingCloudProject ? cloudProjectRoot(rawInput) : rawInput;
   try {
     const result = await api("/api/project/initialize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ project_root: projectRoot, org_id: currentOrg ? currentOrg.id : null }),
     });
+    resolvedProjectRoot = result.project_root;
     discoveredDeployments = result.deployments;
     deploymentSelectEl.innerHTML = discoveredDeployments
       .map((d) => `<option value="${d.name}">${d.name}</option>`)
@@ -1655,35 +1723,7 @@ deploymentSelectEl.onchange = updateEnvironmentOptions;
 btnCreateProjectEl.onclick = async () => {
   addProjectErrorEl.classList.add("hidden");
 
-  if (!editingProjectId && isCloudCreateMode) {
-    const name = projectNameInputEl.value.trim();
-    if (!name) { showAddProjectError("Give this project a name."); return; }
-    const cloudRetentionRaw = retentionDaysInputEl.value.trim();
-    let retentionDays = null;
-    if (cloudRetentionRaw !== "") {
-      const n = Number(cloudRetentionRaw);
-      if (!Number.isInteger(n) || n < 0) {
-        showAddProjectError("Run retention must be a whole number of days (blank = keep forever).");
-        return;
-      }
-      retentionDays = n;
-    }
-    try {
-      const project = await api(`/api/organizations/${currentOrg.id}/cloud-project`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name, retention_days: retentionDays }),
-      });
-      closeModals();
-      await openWorkspace(project);
-      runInit(); // same as the non-cloud "brand-new project" path below
-    } catch (e) {
-      showAddProjectError(e.message);
-    }
-    return;
-  }
-
-  const projectRoot = projectRootInputEl.value.trim();
+  const projectRoot = addingCloudProject ? resolvedProjectRoot : projectRootInputEl.value.trim();
   const deployment = deploymentSelectEl.value;
   const environment = environmentSelectEl.value;
   if (!deployment || !environment) { showAddProjectError("Pick a deployment and environment."); return; }

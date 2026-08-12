@@ -552,6 +552,15 @@ h1 {
   gap: 6px;
 }
 .org-title-main .pill { align-self: flex-start; }
+.local-sync-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.btn.small {
+  padding: 4px 10px;
+  font-size: 12px;
+}
 #org-title-bar h2 {
   margin: 0;
   font-size: 26px;

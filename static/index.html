@@ -59,9 +59,11 @@
     <div id="org-title-bar">
       <div class="org-title-main">
         <h2 id="org-view-name"></h2>
-        <span id="local-sync-pill" class="pill hidden"></span>
+        <span id="local-sync-wrap" class="local-sync-wrap">
+          <span id="local-sync-pill" class="pill hidden"></span>
+          <button id="btn-update-agent" class="btn small hidden">Update agent</button>
+        </span>
       </div>
-      <button id="btn-sync-cloud-org" class="btn hidden" data-tip="Pull the latest from this org's repo and pick up any projects someone else pushed.">&#8635; Sync now</button>
       <button id="btn-add-project" class="btn primary">+ Add Work Project</button>
     </div>
 
@@ -337,12 +339,11 @@
       <label class="field-label">Name</label>
       <input id="project-name-input" placeholder="e.g. QISP-RAG-sandbox (no spaces)" />
 
-      <p id="cloud-project-hint" class="muted hidden">This organization's projects live in its repo -- creating this
-        project will make a <code>&lt;name&gt;/</code> folder there automatically, with a starter
-        <code>modules/</code> + <code>tf-deployment/</code> (main.tf, backend/, environmentVariables/) inside it. It's
-        committed and pushed as soon as you create it -- you'll still need to fill in real values (subscription id,
-        resource group, etc.) in place of the <code>REPLACE_ME</code> placeholders before <code>terraform init</code>
-        will work.</p>
+      <p id="cloud-project-hint" class="muted hidden">This organization's projects live in its repo, not on any one
+        person's disk -- so pick a folder by name, not by local path. Use <b>Select existing folder</b> for one
+        that's already in the repo with a <code>modules/</code> dir and a matching <code>dev</code> tfvars +
+        tfbackend pair, or <b>Initialize new folder</b> to scaffold a fresh starter one. Either way it's committed
+        and pushed as soon as you create the project.</p>
 
       <div id="folder-picker-section">
         <div id="folder-mode-tabs" class="tabs">
@@ -351,10 +352,12 @@
         </div>
 
         <label class="field-label" id="project-root-label">Project folder</label>
-        <div class="confirm-row">
+        <div id="local-folder-row" class="confirm-row">
           <input id="project-root-input" placeholder="C:\path\to\IAC" />
           <button id="btn-browse" class="btn">Browse&hellip;</button>
         </div>
+        <select id="cloud-existing-folder-select" class="hidden"></select>
+        <input id="cloud-new-folder-name-input" class="hidden" placeholder="e.g. my-app (no spaces)" />
         <p id="new-folder-hint" class="muted hidden">Pick an EMPTY folder — this will create <code>modules/</code> and a starter
           <code>tf-deployment/</code> (main.tf, backend/, environmentVariables/) inside it, using the cloud provider selected above.</p>
         <button id="btn-scan" class="btn full-width">Scan Folder</button>
