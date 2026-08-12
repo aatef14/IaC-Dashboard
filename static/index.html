@@ -58,11 +58,10 @@
   <main id="org-view" class="hidden">
     <div id="org-title-bar">
       <h2 id="org-view-name"></h2>
+      <span id="local-sync-pill" class="pill hidden"></span>
       <button id="btn-sync-cloud-org" class="btn hidden" data-tip="Pull the latest from this org's repo and pick up any projects someone else pushed.">&#8635; Sync now</button>
       <button id="btn-add-project" class="btn primary">+ Add Work Project</button>
     </div>
-
-    <div id="local-sync-panel" class="hidden"></div>
 
     <input id="project-search-input" class="search-input" placeholder="Search work projects…" />
     <div id="projects-grid" class="projects-grid"></div>
@@ -409,6 +408,30 @@
       <div class="modal-actions">
         <button class="btn modal-close">Cancel</button>
         <button id="btn-create-org" class="btn primary">Create Organization</button>
+      </div>
+    </div>
+
+    <div id="agent-configure-modal" class="modal hidden">
+      <h2>Set up local sync</h2>
+      <p class="muted">This creates a live, synced copy of <b id="agent-configure-repo-label"></b> in a folder on
+        <b>this computer</b>. The agent will automatically add, commit, and push whatever ends up in that folder as
+        part of keeping it in sync -- so pick an <b>empty</b> folder, or make a dedicated one (e.g.
+        <code>Documents\IaC-Sync\&lt;org-name&gt;</code>). Don't point this at a folder that already has unrelated
+        files in it -- those would get swept into the org's repo too.</p>
+
+      <label class="field-label">Agent token</label>
+      <input id="agent-token-input" placeholder="paste the token the agent printed/copied on startup" />
+
+      <label class="field-label">Local folder</label>
+      <div class="confirm-row">
+        <input id="agent-local-dir-input" placeholder="C:\path\to\local\folder" readonly />
+        <button id="btn-browse-agent-folder" class="btn">Browse&hellip;</button>
+      </div>
+
+      <div id="agent-setup-error" class="warn-text hidden"></div>
+      <div class="modal-actions">
+        <button class="btn modal-close">Cancel</button>
+        <button id="btn-start-agent-sync" class="btn primary">Start Syncing</button>
       </div>
     </div>
 

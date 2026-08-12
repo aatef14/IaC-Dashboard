@@ -401,6 +401,11 @@ h1 {
   border-color: rgba(229, 72, 77, 0.38);
   font-weight: 700;
 }
+.pill.ok {
+  color: var(--ok-ink);
+  background: var(--ok-bg);
+  border-color: rgba(14, 164, 114, 0.32);
+}
 /* quiet, informational pill (e.g. terraform version) -- not a status, so
    deliberately doesn't compete visually with the warn/error auth pill */
 .pill.muted-pill { color: var(--muted); background: var(--neutral-bg); border-color: var(--border); font-weight: 500; }
@@ -1028,20 +1033,6 @@ h1 {
   border: 1px solid var(--border);
   vertical-align: middle;
 }
-
-#local-sync-panel { margin-bottom: 16px; }
-.local-sync-box {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 16px;
-  border-radius: 10px;
-  background: var(--surface);
-  border: 1px solid var(--border);
-}
-.local-sync-box > .field-label:first-of-type { margin-top: 0; }
-.local-sync-box input, .local-sync-box .confirm-row, .local-sync-box .btn.full-width { width: 100%; }
 
 /* compact icon-only badge used in the runs list */
 .badge.status {
