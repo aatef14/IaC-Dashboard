@@ -28,6 +28,7 @@ import io
 import json
 import mimetypes
 import os
+import time
 import urllib.parse
 
 import uvicorn
@@ -528,6 +529,27 @@ async def style_css(request: Request):
     return FileResponse(os.path.join(STATIC_DIR, "style.css"), media_type="text/css", headers=_NO_STORE_HEADERS)
 
 
+_FAVICON_SVG = (
+    b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'>"
+    b"<rect width='32' height='32' rx='7' fill='#2563eb'/>"
+    b"<polyline points='9,10 16,16 9,22' fill='none' stroke='white' stroke-width='3' "
+    b"stroke-linecap='round' stroke-linejoin='round'/>"
+    b"<rect x='18' y='20' width='7' height='3' rx='1' fill='white'/></svg>"
+)
+
+
+@server.custom_route("/favicon.ico", methods=["GET"])
+async def favicon(request: Request):
+    """Browsers request this directly regardless of the <link rel="icon">
+    in index.html/the GitHub login page -- without a real answer here it
+    used to 307 through the auth gate to /auth/login on every unauthenticated
+    page (harmless but noisy), and some browsers would show a stale icon
+    inherited from whatever page the tab was on last (e.g. github.com's own
+    octocat, mid device-flow login) instead of ever getting IaC-Dashboard's
+    own icon."""
+    return Response(_FAVICON_SVG, media_type="image/svg+xml", headers={"Cache-Control": "public, max-age=86400"})
+
+
 _VENDOR_DIR = os.path.join(STATIC_DIR, "vendor")
 
 
@@ -560,50 +582,148 @@ async def vendor_asset(request: Request):
 # the user approves it at github.com/login/device from any device.
 
 
-def _device_login_html(user_code: str, verification_uri: str, interval: int) -> str:
-    poll_ms = max(interval, 3) * 1000
+_GITHUB_MARK_SVG = (
+    '<svg viewBox="0 0 16 16" width="20" height="20" fill="currentColor" aria-hidden="true">'
+    '<path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49'
+    "-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 "
+    "1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 "
+    "0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56."
+    "82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 "
+    '8.01 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>'
+)
+
+_COPY_ICON_SVG = (
+    '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" '
+    'stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="12" height="12" rx="2"/>'
+    '<path d="M5 15V5a2 2 0 0 1 2-2h10"/></svg>'
+)
+
+
+def _device_login_html(pending: dict | None) -> str:
+    """Two-stage page: a plain "Sign in with GitHub" landing state (no
+    device code minted yet -- clicking the button calls /auth/device/start),
+    and an in-progress state with the code + copy button + poll loop, shown
+    directly on load if `pending` (an already in-flight login) is passed."""
+    has_pending = pending is not None
+    user_code = pending["user_code"] if pending else ""
+    verification_uri = pending["verification_uri"] if pending else ""
+    poll_ms = max(pending["interval"], 3) * 1000 if pending else 5000
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Sign in with GitHub</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpolyline points='9,10 16,16 9,22' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3Crect x='18' y='20' width='7' height='3' rx='1' fill='white'/%3E%3C/svg%3E" />
 <style>
-  body {{ font-family: system-ui, sans-serif; background:#0f1420; color:#e7e7ec; display:flex;
-          align-items:center; justify-content:center; height:100vh; margin:0; }}
-  .card {{ background:#171d2e; border:1px solid #2a3350; border-radius:14px; padding:38px 44px;
-           text-align:center; max-width:420px; }}
-  h1 {{ font-size:15px; font-weight:600; margin:0 0 20px; color:#9aa5c9; }}
-  .code {{ font-size:32px; font-weight:700; letter-spacing:5px; background:#0f1420;
-           border:1px solid #2a3350; border-radius:8px; padding:14px 8px; margin-bottom:20px; }}
-  a.btn {{ display:inline-block; background:#2563eb; color:#fff; text-decoration:none;
-           padding:10px 22px; border-radius:8px; font-weight:600; margin-bottom:18px; }}
-  a.btn:hover {{ background:#1d4ed8; }}
-  #status {{ font-size:13px; color:#9aa5c9; }}
+  * {{ box-sizing: border-box; }}
+  body {{ font-family: system-ui, -apple-system, sans-serif; background: radial-gradient(circle at 50% 0%, #182238, #0b0f1a 65%);
+          color:#e7e7ec; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; }}
+  .card {{ background:#151b2c; border:1px solid #262f47; border-radius:16px; padding:40px 40px 34px;
+           text-align:center; max-width:400px; width:100%; box-shadow: 0 20px 60px rgba(0,0,0,0.45); }}
+  .brand {{ font-size:13px; font-weight:700; letter-spacing:0.06em; color:#5b8def; text-transform:uppercase; margin-bottom:22px; }}
+  h1 {{ font-size:19px; font-weight:650; margin:0 0 8px; color:#eef1f8; }}
+  p.sub {{ font-size:13px; color:#8b93ab; margin:0 0 28px; line-height:1.5; }}
+  .btn-github {{ display:flex; align-items:center; justify-content:center; gap:10px; width:100%;
+           background:#1f2733; color:#fff; border:1px solid #333f56; text-decoration:none;
+           padding:12px 20px; border-radius:10px; font-weight:600; font-size:14px; cursor:pointer;
+           transition: background 0.15s ease, border-color 0.15s ease; }}
+  .btn-github:hover {{ background:#28324450; border-color:#4b5878; }}
+  a.btn-primary {{ display:block; background:#2563eb; color:#fff; text-decoration:none;
+           padding:12px 20px; border-radius:10px; font-weight:650; font-size:14px; margin-bottom:16px;
+           transition: background 0.15s ease; }}
+  a.btn-primary:hover {{ background:#1d4ed8; }}
+  .code-row {{ display:flex; align-items:stretch; gap:8px; margin-bottom:22px; }}
+  .code {{ flex:1; font-size:28px; font-weight:700; letter-spacing:4px; background:#0d121f;
+           border:1px solid #262f47; border-radius:10px; padding:14px 6px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }}
+  .btn-copy {{ flex-shrink:0; width:44px; background:#1f2733; border:1px solid #333f56; border-radius:10px;
+           color:#aab4cc; cursor:pointer; display:flex; align-items:center; justify-content:center;
+           transition: background 0.15s ease, color 0.15s ease; }}
+  .btn-copy:hover {{ background:#28324450; color:#fff; }}
+  .btn-copy.copied {{ color:#34d399; border-color:#1c5f47; }}
+  #status {{ font-size:13px; color:#7c8499; }}
+  #status.err {{ color:#f28b8b; }}
+  .hidden {{ display:none; }}
+  .spinner {{ display:inline-block; width:11px; height:11px; border:2px solid #384565; border-top-color:#5b8def;
+           border-radius:50%; animation:spin 0.8s linear infinite; margin-right:7px; vertical-align:-1px; }}
+  @keyframes spin {{ to {{ transform:rotate(360deg); }} }}
 </style></head>
 <body>
   <div class="card">
-    <h1>Sign in to IaC-Dashboard with GitHub</h1>
-    <div class="code">{user_code}</div>
-    <div><a class="btn" href="{verification_uri}" target="_blank" rel="noopener">Open GitHub &amp; enter code</a></div>
-    <div id="status">Waiting for approval&hellip;</div>
+    <div class="brand">IaC-Dashboard</div>
+
+    <div id="stage-login" class="{'hidden' if has_pending else ''}">
+      <h1>Sign in required</h1>
+      <p class="sub">This dashboard can run real Terraform changes and open a real shell -- sign in with GitHub to continue.</p>
+      <button id="btn-start" class="btn-github">{_GITHUB_MARK_SVG}<span>Sign in with GitHub</span></button>
+    </div>
+
+    <div id="stage-code" class="{'' if has_pending else 'hidden'}">
+      <h1>Enter this code on GitHub</h1>
+      <p class="sub">Go to <strong>{verification_uri}</strong> and enter the code below.</p>
+      <div class="code-row">
+        <div class="code" id="code-text">{user_code}</div>
+        <button id="btn-copy" class="btn-copy" title="Copy code">{_COPY_ICON_SVG}</button>
+      </div>
+      <a id="link-github" class="btn-primary" href="{verification_uri}" target="_blank" rel="noopener">Open GitHub &amp; enter code</a>
+      <div id="status"><span class="spinner"></span>Waiting for approval&hellip;</div>
+    </div>
   </div>
   <script>
+    const stageLogin = document.getElementById("stage-login");
+    const stageCode = document.getElementById("stage-code");
+    const statusEl = document.getElementById("status");
+    const codeTextEl = document.getElementById("code-text");
+    const linkEl = document.getElementById("link-github");
+    const copyBtn = document.getElementById("btn-copy");
+    let nextDelayMs = {poll_ms};
+
+    copyBtn.onclick = async () => {{
+      try {{
+        await navigator.clipboard.writeText(codeTextEl.textContent.trim());
+        copyBtn.classList.add("copied");
+        setTimeout(() => copyBtn.classList.remove("copied"), 1500);
+      }} catch (e) {{ /* clipboard permission denied -- code is still visible to copy by hand */ }}
+    }};
+
     async function poll() {{
       try {{
         const res = await fetch("/auth/device/status");
         const body = await res.json();
         if (body.status === "complete") {{
-          document.getElementById("status").textContent = "Signed in! Redirecting...";
+          statusEl.innerHTML = "Signed in! Redirecting&hellip;";
           window.location.href = "/";
           return;
         }}
         if (body.status === "error") {{
-          document.getElementById("status").textContent = body.message;
+          statusEl.textContent = body.message;
+          statusEl.classList.add("err");
           return;
         }}
+        // "pending" carries GitHub's current required interval -- when it
+        // sends slow_down, that interval goes UP, and polling faster than
+        // whatever it just told us guarantees the next poll gets slow_down
+        // again too, forever. Always use the latest value it gave us.
+        if (body.interval) nextDelayMs = Math.max(body.interval, 3) * 1000;
       }} catch (e) {{
-        document.getElementById("status").textContent = "Connection error, retrying...";
+        statusEl.textContent = "Connection error, retrying...";
       }}
-      setTimeout(poll, {poll_ms});
+      setTimeout(poll, nextDelayMs);
     }}
-    setTimeout(poll, {poll_ms});
+
+    document.getElementById("btn-start").onclick = async () => {{
+      try {{
+        const res = await fetch("/auth/device/start", {{ method: "POST" }});
+        const body = await res.json();
+        if (!res.ok) {{ statusEl.textContent = body.error || "Could not start sign-in."; return; }}
+        codeTextEl.textContent = body.user_code;
+        linkEl.href = body.verification_uri;
+        stageLogin.classList.add("hidden");
+        stageCode.classList.remove("hidden");
+        nextDelayMs = Math.max(body.interval, 3) * 1000;
+        setTimeout(poll, nextDelayMs);
+      }} catch (e) {{
+        statusEl.textContent = "Could not reach the server.";
+      }}
+    }};
+
+    {"setTimeout(poll, nextDelayMs);" if has_pending else ""}
   </script>
 </body></html>"""
 
@@ -612,6 +732,29 @@ def _device_login_html(user_code: str, verification_uri: str, interval: int) -> 
 async def auth_login(request: Request):
     if not ghauth.GITHUB_AUTH_ENABLED:
         return JSONResponse({"error": "GitHub sign-in is not configured on this server"}, status_code=404)
+    # Reuse an in-flight login unchanged if this browser already has a
+    # valid one, rather than always landing on the plain "Sign in" stage --
+    # otherwise navigating back to this URL while a code is still being
+    # approved would abandon it.
+    pending = ghauth.read_device_pending_cookie(request.cookies.get(ghauth.DEVICE_PENDING_COOKIE))
+    return Response(_device_login_html(pending), media_type="text/html")
+
+
+@server.custom_route("/auth/device/start", methods=["POST"])
+async def auth_device_start(request: Request):
+    if not ghauth.GITHUB_AUTH_ENABLED:
+        return JSONResponse({"error": "GitHub sign-in is not configured on this server"}, status_code=404)
+
+    # Same in-flight reuse as /auth/login itself -- clicking "Sign in with
+    # GitHub" twice (e.g. a slow first click, then a second while the first
+    # request is still in flight) must not mint a second code and silently
+    # abandon the first.
+    pending = ghauth.read_device_pending_cookie(request.cookies.get(ghauth.DEVICE_PENDING_COOKIE))
+    if pending:
+        return JSONResponse(
+            {"user_code": pending["user_code"], "verification_uri": pending["verification_uri"], "interval": pending["interval"]}
+        )
+
     try:
         device = await asyncio.to_thread(ghauth.request_device_code)
         user_code = device["user_code"]
@@ -621,10 +764,11 @@ async def auth_login(request: Request):
     except Exception as e:
         return JSONResponse({"error": f"could not start GitHub sign-in: {e}"}, status_code=502)
 
-    resp = Response(_device_login_html(user_code, verification_uri, interval), media_type="text/html")
+    expires_at = int(time.time()) + expires_in
+    resp = JSONResponse({"user_code": user_code, "verification_uri": verification_uri, "interval": interval})
     resp.set_cookie(
         ghauth.DEVICE_PENDING_COOKIE,
-        ghauth.create_device_pending_cookie_value(device["device_code"], interval, expires_in),
+        ghauth.create_device_pending_cookie_value(device["device_code"], user_code, verification_uri, interval, expires_at),
         max_age=expires_in,
         httponly=True,
         samesite="lax",
@@ -639,7 +783,11 @@ async def auth_device_status(request: Request):
     pending = ghauth.read_device_pending_cookie(request.cookies.get(ghauth.DEVICE_PENDING_COOKIE))
     if not pending:
         return JSONResponse({"status": "error", "message": "Login attempt expired -- refresh this page to try again."})
-    device_code, interval = pending
+    device_code = pending["device_code"]
+    user_code = pending["user_code"]
+    verification_uri = pending["verification_uri"]
+    interval = pending["interval"]
+    expires_at = pending["expires_at"]
 
     try:
         result = await asyncio.to_thread(ghauth.poll_device_token, device_code)
@@ -664,8 +812,25 @@ async def auth_device_status(request: Request):
         return resp
 
     error = result.get("error")
-    if error in ("authorization_pending", "slow_down"):
-        return JSONResponse({"status": "pending"})
+    if error == "authorization_pending":
+        return JSONResponse({"status": "pending", "interval": interval})
+    if error == "slow_down":
+        # GitHub's own remedy for polling too fast: it tells us the new,
+        # longer interval to use -- if we don't actually honor it (the bug
+        # here originally), it keeps demanding an even longer wait forever
+        # and the poll can never succeed, no matter how long you wait or
+        # how many times you approve the code.
+        new_interval = result.get("interval", interval + 5)
+        remaining = max(1, expires_at - int(time.time()))
+        resp = JSONResponse({"status": "pending", "interval": new_interval})
+        resp.set_cookie(
+            ghauth.DEVICE_PENDING_COOKIE,
+            ghauth.create_device_pending_cookie_value(device_code, user_code, verification_uri, new_interval, expires_at),
+            max_age=remaining,
+            httponly=True,
+            samesite="lax",
+        )
+        return resp
     if error == "expired_token":
         return JSONResponse({"status": "error", "message": "Code expired -- refresh this page to get a new one."})
     if error == "access_denied":
@@ -1283,8 +1448,8 @@ server._custom_starlette_routes.append(WebSocketRoute("/api/projects/{project_id
 #     and confusing), unauthenticated websocket connects just get closed.
 # ===================================================================================
 
-_PUBLIC_PATH_PREFIXES = ("/auth/", "/vendor/")
-_PUBLIC_PATHS = {"/style.css", "/app.js", "/api/auth/me"}
+_PUBLIC_PATH_PREFIXES = ("/auth/", "/vendor/", "/.well-known/")
+_PUBLIC_PATHS = {"/style.css", "/app.js", "/api/auth/me", "/favicon.ico"}
 
 
 class AuthGateMiddleware:

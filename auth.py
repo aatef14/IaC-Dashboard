@@ -93,21 +93,49 @@ def read_session_cookie(token: str | None) -> str | None:
     return _verify(token)
 
 
-def create_device_pending_cookie_value(device_code: str, interval: int, expires_in: int) -> str:
-    return _sign(f"{device_code}:{interval}", expires_in)
+def create_device_pending_cookie_value(
+    device_code: str, user_code: str, verification_uri: str, interval: int, expires_at: int
+) -> str:
+    """expires_at is an ABSOLUTE unix timestamp -- GitHub's real, fixed
+    expiry for this device_code (~15 min from when it was first issued),
+    not a relative "extend by N seconds" duration. Every re-sign (idempotent
+    reuse in /auth/login, the interval bump on slow_down) must pass the
+    SAME expires_at through unchanged. Resetting it to a fresh window on
+    each re-sign was an earlier bug here: it kept the login page reporting
+    "waiting for approval" well past the point GitHub had already expired
+    the underlying code, so approving it then failed with a confusing
+    "we couldn't find anything" on GitHub's own page."""
+    remaining = max(1, expires_at - int(time.time()))
+    return _sign(f"{device_code}|{user_code}|{verification_uri}|{interval}|{expires_at}", remaining)
 
 
-def read_device_pending_cookie(token: str | None) -> tuple[str, int] | None:
-    """Returns (device_code, poll_interval_seconds), or None if
-    missing/tampered/expired."""
+def read_device_pending_cookie(token: str | None) -> dict | None:
+    """Returns {device_code, user_code, verification_uri, interval,
+    expires_at}, or None if missing/tampered/expired. Carrying
+    user_code/verification_uri here (not just device_code) lets
+    /auth/login redisplay an in-flight login unchanged instead of minting
+    a fresh code every time it's hit -- which matters because it gets hit
+    by more than just the user opening the page (e.g. a browser's own
+    background devtools probe reaching an unauthenticated path redirects
+    here too), and silently replacing an in-flight code the user is
+    actively approving is exactly the bug this avoids."""
     if not token:
         return None
     value = _verify(token)
     if not value:
         return None
     try:
-        device_code, interval = value.rsplit(":", 1)
-        return device_code, int(interval)
+        device_code, user_code, verification_uri, interval, expires_at = value.split("|", 4)
+        expires_at = int(expires_at)
+        if time.time() > expires_at:
+            return None
+        return {
+            "device_code": device_code,
+            "user_code": user_code,
+            "verification_uri": verification_uri,
+            "interval": int(interval),
+            "expires_at": expires_at,
+        }
     except ValueError:
         return None
 
