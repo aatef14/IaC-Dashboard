@@ -580,6 +580,26 @@ async def vendor_asset(request: Request):
     return FileResponse(full_path, media_type=media_type or "application/octet-stream")
 
 
+_SYNC_AGENT_EXE_PATH = os.path.join(os.path.dirname(__file__), "sync_agent", "dist", "IaCSyncAgent.exe")
+
+
+@server.custom_route("/download/sync-agent", methods=["GET"])
+async def download_sync_agent(request: Request):
+    """Serves the Sync Agent .exe (see sync_agent/README.md) -- built via
+    `python -m PyInstaller --onefile --console --name IaCSyncAgent
+    sync_agent.py` from sync_agent/, gitignored since it's a large binary
+    that should be handed out directly rather than committed. A 404 here
+    just means whoever's running this dashboard instance hasn't built it
+    yet -- not a broken feature."""
+    if not os.path.isfile(_SYNC_AGENT_EXE_PATH):
+        return JSONResponse(
+            {"error": "Sync Agent hasn't been built on this server yet -- see sync_agent/README.md"}, status_code=404
+        )
+    return FileResponse(
+        _SYNC_AGENT_EXE_PATH, media_type="application/octet-stream", filename="IaCSyncAgent.exe"
+    )
+
+
 # ===================================================================================
 # DASHBOARD -- GitHub sign-in (Device Flow)
 # ===================================================================================

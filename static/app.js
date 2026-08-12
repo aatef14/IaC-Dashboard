@@ -620,6 +620,7 @@ async function renderLocalSyncPanel(org) {
     localSyncPanelEl.innerHTML = `
       <div class="local-sync-box">
         <span class="muted">Local Sync Agent not detected on this computer.</span>
+        <a href="/download/sync-agent" class="btn" download>&#8615; Download Sync Agent</a>
         <button id="btn-recheck-agent" class="btn">Check again</button>
       </div>`;
     document.getElementById("btn-recheck-agent").onclick = () => renderLocalSyncPanel(org);

@@ -1,0 +1,7 @@
+# Only needed to BUILD IaCSyncAgent.exe -- the agent script itself has no
+# dependencies beyond the Python standard library plus tkinter (bundled
+# with Python on Windows). pystray/Pillow add the tray icon; PyInstaller
+# packages everything into one standalone .exe.
+pyinstaller
+pystray
+pillow

@@ -1,32 +1,36 @@
 """
-IaC-Dashboard Sync Agent -- a small local companion program with NO UI of
-its own. Every control (repo URL, local folder, when to sync) happens from
-the dashboard website, in your browser; this just exposes a local HTTP API
-on 127.0.0.1 that the website's JS calls directly. Runs until you close
-this window.
+IaC-Dashboard Sync Agent -- a small local companion program with NO
+CONFIGURATION UI of its own. Every control (repo URL, local folder, when
+to sync) happens from the dashboard website, in your browser; this just
+exposes a local HTTP API on 127.0.0.1 that the website's JS calls
+directly. Runs headless in the background -- a small tray icon is the only
+visible trace, with just a "Quit" option, since a genuinely background
+process still needs SOME way to stop it besides Task Manager.
 
 Why this exists: a website's JavaScript is sandboxed from your actual file
 system -- there's no way for a "Sync" button on any website to run `git
 clone`/`git pull` against a folder on YOUR disk. The only thing that can
 touch your disk is a real program running on your machine, which is what
-this is. It's deliberately as thin as possible: no config UI, no tray
-icon, just an API the dashboard drives.
+this is.
 
 Security model: binds to 127.0.0.1 only (never reachable from the network,
 same as this being on your own machine already implies), and every
-mutating request must include the token printed below in an
-`Authorization: Bearer <token>` header -- generated once, persisted, and
-never sent anywhere except typed into the dashboard by you. Without the
-token, an unrelated malicious site your browser happens to have open could
-otherwise probe 127.0.0.1 and trigger syncs.
+mutating request must include the token (shown in the first-run dialog,
+auto-copied to your clipboard, and saved in token.txt next to config.json
+-- see below) in an `Authorization: Bearer <token>` header -- generated
+once, persisted, and never sent anywhere except typed into the dashboard
+by you. Without the token, an unrelated malicious site your browser
+happens to have open could otherwise probe 127.0.0.1 and trigger syncs.
 """
 
 import json
 import os
+import queue
 import secrets
 import shutil
 import subprocess
 import sys
+import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = 9876
@@ -47,11 +51,34 @@ def _save_config(config: dict):
         json.dump(config, f, indent=2)
 
 
-_config = _load_config()
-if "token" not in _config:
-    _config["token"] = secrets.token_urlsafe(24)
-    _save_config(_config)
+def _load_or_create_config() -> dict:
+    """Only one thing here truly needs to be race-free: the very first
+    token generation. A plain check-then-write (does config exist? no ->
+    generate and save) has a window where two instances starting close
+    together (e.g. auto-start-at-login racing a manual double-click) can
+    each decide no config exists yet and generate their OWN token -- the
+    one that saves LAST silently wins, and the other instance keeps
+    running with a token that no longer matches what's on disk, which
+    looks exactly like "the token is wrong" even though it's the same
+    string that got printed. os.O_CREAT | O_EXCL makes the create step
+    atomic: only one process can ever win it, and the loser reads back
+    whatever the winner actually wrote instead of trusting its own guess."""
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    os.makedirs(CONFIG_DIR, exist_ok=True)
+    new_config = {"token": secrets.token_urlsafe(24)}
+    try:
+        fd = os.open(CONFIG_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(new_config, f, indent=2)
+        return new_config
+    except FileExistsError:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
 
+
+_config = _load_or_create_config()
 TOKEN = _config["token"]
 
 
@@ -67,6 +94,83 @@ def _run_git(args, cwd, timeout=120) -> str:
     if result.returncode != 0:
         raise RuntimeError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
     return result.stdout
+
+
+# Tkinter/Tcl is not thread-safe -- creating a fresh Tk() from whatever
+# HTTP worker thread happens to handle a /browse-folder request works fine
+# in isolation, but once the tray icon's own native message loop is
+# occupying the actual main thread (see _run_tray_icon), Tcl gets confused
+# about which thread is "the" main one and every dialog call fails with
+# "main thread is not in main loop". The fix: one persistent hidden Tk
+# root, created once on its own dedicated thread that just runs
+# mainloop() forever. Every tkinter operation (folder dialog, clipboard
+# copy, message dialogs) gets submitted as a callable via a thread-safe
+# queue.Queue -- the ONLY thing that actually crosses threads -- which the
+# Tk thread polls and executes itself; calling something like root.after()
+# directly FROM a foreign thread isn't reliably guaranteed thread-safe
+# either, so this avoids that question entirely.
+_tk_root = None
+_tk_ready = threading.Event()
+_tk_work_queue = queue.Queue()
+
+
+def _tk_thread_main():
+    global _tk_root
+    import tkinter
+
+    _tk_root = tkinter.Tk()
+    _tk_root.withdraw()
+    _tk_ready.set()
+
+    def _poll_queue():
+        try:
+            while True:
+                job = _tk_work_queue.get_nowait()
+                job()
+        except queue.Empty:
+            pass
+        _tk_root.after(50, _poll_queue)
+
+    _tk_root.after(50, _poll_queue)
+    _tk_root.mainloop()
+
+
+def _run_on_tk_thread(fn, timeout: int = 300):
+    """Submits fn (a zero-arg callable that does the actual tkinter work)
+    to run on the dedicated Tk thread and blocks until it completes.
+    Re-raises whatever fn raised, in the calling thread, so callers can
+    handle failures normally."""
+    _tk_ready.wait()
+    done = threading.Event()
+    outcome = {}
+
+    def _wrapped():
+        try:
+            outcome["value"] = fn()
+        except Exception as e:
+            outcome["error"] = e
+        done.set()
+
+    _tk_work_queue.put(_wrapped)
+    if not done.wait(timeout=timeout):
+        raise TimeoutError("timed out waiting for the tkinter thread")
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome.get("value")
+
+
+def _ask_directory_on_tk_thread() -> str | None:
+    def fn():
+        from tkinter import filedialog
+
+        _tk_root.attributes("-topmost", True)
+        path = filedialog.askdirectory(title="Choose a folder for IaC-Dashboard to sync into")
+        return path or None
+
+    try:
+        return _run_on_tk_thread(fn)
+    except Exception:
+        return None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -126,15 +230,8 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if self.path == "/browse-folder":
-                import tkinter
-                from tkinter import filedialog
-
-                root = tkinter.Tk()
-                root.withdraw()
-                root.attributes("-topmost", True)
-                path = filedialog.askdirectory(title="Choose a folder for IaC-Dashboard to sync into")
-                root.destroy()
-                self._send_json(200, {"path": path or None})
+                path = _ask_directory_on_tk_thread()
+                self._send_json(200, {"path": path})
                 return
 
             if self.path == "/configure":
@@ -183,26 +280,158 @@ class Handler(BaseHTTPRequestHandler):
             self._send_json(500, {"error": str(e)})
 
 
+def _register_autostart():
+    """Registers this exe to launch automatically at Windows login (HKCU
+    Run key -- no admin rights needed, unlike the machine-wide equivalent).
+    Only meaningful for the packaged .exe (sys.frozen); running the raw
+    .py via `python sync_agent.py` skips this, since "auto-start python
+    sync_agent.py" wouldn't work without the interpreter/cwd also being
+    right. Re-writes the value every startup (idempotent) so it stays
+    correct if you move the .exe -- the alternative, checking whether it's
+    already set first, would leave a stale path behind after a move
+    instead of just fixing it."""
+    if not getattr(sys, "frozen", False):
+        return None
+    try:
+        import winreg
+
+        exe_path = sys.executable
+        key = winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Run", 0, winreg.KEY_SET_VALUE
+        )
+        winreg.SetValueEx(key, "IaCDashboardSyncAgent", 0, winreg.REG_SZ, f'"{exe_path}"')
+        winreg.CloseKey(key)
+        return True
+    except Exception as e:
+        print(f"(Could not register auto-start at login: {e} -- you'll need to run this manually each time.)")
+        return False
+
+
+def _copy_to_clipboard(text: str) -> bool:
+    """Best-effort -- reuses tkinter (already a dependency, for the folder
+    dialog) rather than pulling in a separate clipboard library. Not a
+    security boundary either way: this just saves you selecting/copying
+    text out of the console window by hand, it doesn't change who can
+    retrieve the token (still only whoever's sitting at this keyboard)."""
+
+    def fn():
+        _tk_root.clipboard_clear()
+        _tk_root.clipboard_append(text)
+        _tk_root.update()  # actually flush the clipboard write
+        return True
+
+    try:
+        return _run_on_tk_thread(fn, timeout=10)
+    except Exception:
+        return False
+
+
+_TOKEN_FILE_PATH = os.path.join(CONFIG_DIR, "token.txt")
+
+
+def _write_token_file():
+    """A console would normally be where you'd re-read a forgotten token
+    from -- there isn't one in this headless build, so this file is the
+    fallback instead of the token only ever existing in a clipboard buffer
+    that gets overwritten by the next thing you copy."""
+    try:
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        with open(_TOKEN_FILE_PATH, "w", encoding="utf-8") as f:
+            f.write(TOKEN)
+    except Exception:
+        pass
+
+
+def _show_message(title: str, message: str, timeout: int = 300):
+    """Blocks the caller until dismissed (or timeout), same as
+    messagebox.showinfo normally would."""
+
+    def fn():
+        from tkinter import messagebox
+
+        messagebox.showinfo(title, message, parent=_tk_root)
+
+    try:
+        _run_on_tk_thread(fn, timeout=timeout)
+    except Exception:
+        pass
+
+
+def _run_tray_icon(server):
+    """Blocks the calling thread until Quit is clicked. If pystray/Pillow
+    aren't available in this build for some reason, falls back to just
+    sleeping forever instead -- still fully functional (the HTTP server
+    itself doesn't need the tray to work), just with no visible way to
+    stop it besides Task Manager or logging off."""
+    try:
+        import pystray
+        from PIL import Image, ImageDraw
+    except Exception:
+        try:
+            threading.Event().wait()  # blocks forever without busy-waiting
+        except KeyboardInterrupt:
+            pass
+        return
+
+    image = Image.new("RGB", (64, 64), "#0d121f")
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle([2, 2, 61, 61], radius=12, fill="#2563eb")
+    draw.text((24, 20), "S", fill="white")
+
+    def on_quit(icon, item):
+        icon.stop()
+        server.shutdown()
+
+    icon = pystray.Icon(
+        "iac-sync-agent",
+        image,
+        "IaC-Dashboard Sync Agent (running)",
+        menu=pystray.Menu(
+            pystray.MenuItem("IaC-Dashboard Sync Agent", None, enabled=False),
+            pystray.MenuItem("Quit", on_quit),
+        ),
+    )
+    icon.run()
+
+
 def main():
-    print("=== IaC-Dashboard Sync Agent ===")
-    print()
-    print(f"Token (paste this into the dashboard's 'Sync to my computer' box):")
-    print()
-    print(f"    {TOKEN}")
-    print()
-    print(f"Listening on http://127.0.0.1:{PORT} -- leave this window open while you want syncing to work.")
-    print("Close this window (or Ctrl+C) to stop.")
-    print()
+    is_first_run = not os.path.exists(_TOKEN_FILE_PATH)
+    _register_autostart()
+    _write_token_file()
+
+    # Starts before anything else uses tkinter (clipboard copy, the
+    # message dialogs below, and later the folder-browse endpoint) -- see
+    # the comment above _tk_thread_main for why everything tkinter-related
+    # has to funnel through this one persistent thread.
+    threading.Thread(target=_tk_thread_main, daemon=True).start()
+
+    copied = _copy_to_clipboard(TOKEN)
+
     try:
         server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
     except OSError as e:
-        print(f"Could not start: {e}")
-        print(f"(Is another copy of this agent already running? It listens on port {PORT}.)")
-        input("Press Enter to exit...")
+        _show_message(
+            "IaC-Dashboard Sync Agent -- could not start",
+            f"{e}\n\nIs another copy of this agent already running? It listens on port {PORT}.",
+        )
         sys.exit(1)
+
+    # Server starts FIRST, before the (blocking) first-run dialog -- the
+    # API has to be immediately usable regardless of whether/when someone
+    # actually dismisses that informational popup.
+    server_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    server_thread.start()
+
+    if is_first_run:
+        _show_message(
+            "IaC-Dashboard Sync Agent",
+            "Running in the background -- look for its icon in the system tray (click Quit there to stop it).\n\n"
+            + ("Your pairing token has been copied to your clipboard; " if copied else "")
+            + "paste it into the dashboard's 'Local Sync Agent' panel.\n\n"
+            f"If you need the token again later, it's saved in:\n{_TOKEN_FILE_PATH}",
+        )
+
+    _run_tray_icon(server)
 
 
 if __name__ == "__main__":
