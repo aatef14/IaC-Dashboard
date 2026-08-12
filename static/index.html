@@ -394,6 +394,13 @@
           pushed to, this repo -- so anyone who creates an org with the same name and this same repo URL sees the
           same projects. Uses whatever git credentials already work on this machine; make sure it's a
           <b>private</b> repo, since real project data gets committed into it.</p>
+
+        <label class="field-label">Clone location (optional)</label>
+        <div class="confirm-row">
+          <input id="org-clone-path-input" placeholder="blank = a default folder next to the dashboard" />
+          <button id="btn-browse-clone-path" class="btn">Browse&hellip;</button>
+        </div>
+        <p class="muted">Where the repo gets cloned to on this machine. Must be an empty (or not-yet-existing) folder.</p>
       </div>
       <div id="add-org-warning" class="warn-text hidden"></div>
       <div id="add-org-error" class="warn-text hidden"></div>

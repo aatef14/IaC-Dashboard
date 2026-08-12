@@ -35,6 +35,8 @@ const tabOrgCloudEl = document.getElementById("tab-org-cloud");
 const orgModeHintEl = document.getElementById("org-mode-hint");
 const orgRepoUrlBoxEl = document.getElementById("org-repo-url-box");
 const orgRepoUrlInputEl = document.getElementById("org-repo-url-input");
+const orgClonePathInputEl = document.getElementById("org-clone-path-input");
+const btnBrowseClonePathEl = document.getElementById("btn-browse-clone-path");
 
 const projectNameInputEl = document.getElementById("project-name-input");
 const tabExistingFolderEl = document.getElementById("tab-existing-folder");
@@ -1223,10 +1225,25 @@ tabOrgCloudEl.onclick = () => setOrgMode("cloud");
 btnAddOrgEl.onclick = () => {
   orgNameInputEl.value = "";
   orgRepoUrlInputEl.value = "";
+  orgClonePathInputEl.value = "";
   addOrgErrorEl.classList.add("hidden");
   addOrgWarningEl.classList.add("hidden");
   setOrgMode("local");
   openModal(addOrgModalEl);
+};
+
+btnBrowseClonePathEl.onclick = async () => {
+  try {
+    const { path } = await api("/api/browse-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    if (path) orgClonePathInputEl.value = path;
+  } catch (e) {
+    addOrgErrorEl.textContent = e.message;
+    addOrgErrorEl.classList.remove("hidden");
+  }
 };
 
 btnCreateOrgEl.onclick = async () => {
@@ -1244,6 +1261,7 @@ btnCreateOrgEl.onclick = async () => {
     addOrgErrorEl.classList.remove("hidden");
     return;
   }
+  const clonePath = orgClonePathInputEl.value.trim();
   const originalLabel = btnCreateOrgEl.textContent;
   if (addOrgMode === "cloud") btnCreateOrgEl.textContent = "Cloning repo…";
   btnCreateOrgEl.disabled = true;
@@ -1251,7 +1269,12 @@ btnCreateOrgEl.onclick = async () => {
     const org = await api("/api/organizations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name, mode: addOrgMode, repo_url: addOrgMode === "cloud" ? repoUrl : undefined }),
+      body: JSON.stringify({
+        name,
+        mode: addOrgMode,
+        repo_url: addOrgMode === "cloud" ? repoUrl : undefined,
+        clone_path: addOrgMode === "cloud" && clonePath ? clonePath : undefined,
+      }),
     });
     if (org.warning) {
       // Non-fatal (e.g. the repo looks public) -- org was still created,
@@ -3347,14 +3370,20 @@ async function saveCurrentEditorFile({ silent = false, path = editorCurrentPath 
   const content = state.model.getValue();
   btnSaveFileEl.disabled = true;
   try {
-    await api(`/api/projects/${editorProject.id}/file`, {
+    const result = await api(`/api/projects/${editorProject.id}/file`, {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ path, content }),
     });
     state.originalContent = content;
     editorBlockedBadgeEl.classList.add("hidden");
-    if (!silent) {
+    if (result.sync_warning) {
+      // Cloud org project: the save itself landed on disk fine, but
+      // committing/pushing it failed (no network, no credentials) -- flag
+      // that distinctly, since silently succeeding here would mean this
+      // edit never actually reaches the shared repo at all.
+      toast(result.sync_warning, { type: "warning", duration: 8000 });
+    } else if (!silent) {
       toast(`Saved ${path}.`, {
         type: "success",
         action: { label: "Validate", onClick: () => runFileEditorValidate() },

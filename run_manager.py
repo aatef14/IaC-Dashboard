@@ -117,24 +117,29 @@ def _validate_name(name: str, what: str) -> str:
     return name
 
 
-def add_org(name: str, mode: str = "local", repo_url: str | None = None) -> dict:
+def add_org(name: str, mode: str = "local", repo_url: str | None = None, clone_path: str | None = None) -> dict:
     """mode="cloud" clones repo_url and syncs this org's projects from the
     manifest committed there (see the CLOUD ORGANIZATIONS section below) --
     everything else about a Cloud org is identical to a Local one from
     here on. mode="local" (the default) is completely unchanged from
-    before this existed."""
+    before this existed.
+
+    clone_path picks where the clone lives on disk -- must be empty or
+    not-yet-existing (git clone itself enforces that). Defaults to
+    cloud-orgs/<org_id>/repo, next to this app, if left unset."""
     name = _validate_name(name, "organization")
     mode = "cloud" if mode == "cloud" else "local"
 
     org_id = str(uuid.uuid4())
     org = {"id": org_id, "name": name, "created_at": time.time(), "mode": mode}
     warning = None
+    used_default_clone_path = not (clone_path or "").strip()
 
     if mode == "cloud":
         repo_url = (repo_url or "").strip()
         if not repo_url:
             raise ValueError("a Git repo URL is required for a Cloud organization")
-        repo_dir = _cloud_repo_dir(org_id)
+        repo_dir = _cloud_repo_dir(org_id) if used_default_clone_path else os.path.normpath(clone_path.strip())
         _clone_cloud_repo(repo_url, repo_dir)
         org["repo_url"] = repo_url
         org["local_repo_path"] = repo_dir
@@ -144,13 +149,15 @@ def add_org(name: str, mode: str = "local", repo_url: str | None = None) -> dict
         orgs = _load_orgs()
         if any(o["name"] == name for o in orgs):
             if mode == "cloud":
-                # Otherwise the clone we just made is left orphaned under
-                # cloud-orgs/ with nothing in organizations.json pointing
-                # at it. Removes the org_id parent dir, not just repo/ --
-                # _cloud_repo_dir nests the clone one level deeper than the
-                # org_id folder itself, which would otherwise be left
-                # behind, empty.
-                shutil.rmtree(os.path.dirname(org["local_repo_path"]), ignore_errors=True)
+                # Otherwise the clone we just made is left orphaned with
+                # nothing in organizations.json pointing at it. Only the
+                # default path's org_id-scoped parent folder is safe to
+                # remove wholesale (it exists solely for this clone); a
+                # user-picked clone_path could be ANY folder on their
+                # disk (Desktop, home dir...), so only the clone itself
+                # gets removed there, never its parent.
+                target = os.path.dirname(org["local_repo_path"]) if used_default_clone_path else org["local_repo_path"]
+                shutil.rmtree(target, ignore_errors=True)
             raise ValueError(f"an organization named '{name}' already exists -- pick a different name")
         orgs.append(org)
         _save_orgs(orgs)
@@ -210,9 +217,19 @@ def remove_org(org_id: str):
         _save_orgs(orgs)
 
     if org and org.get("mode") == "cloud" and org.get("local_repo_path"):
-        # Removes the org_id parent dir, not just repo/ -- see the matching
-        # comment in add_org's name-collision cleanup.
-        shutil.rmtree(os.path.dirname(org["local_repo_path"]), ignore_errors=True)
+        # Removes the org_id parent dir, not just repo/, ONLY for the
+        # default clone_path structure (cloud-orgs/<org_id>/repo) -- that
+        # parent folder exists solely for this clone, safe to remove
+        # wholesale. A custom clone_path could be any folder the user
+        # picked (Desktop, home dir...), so only the clone itself is
+        # removed there, never its parent -- see add_org's matching logic.
+        repo_path = org["local_repo_path"]
+        try:
+            is_default_path = os.path.commonpath([CLOUD_ORGS_DIR, repo_path]) == os.path.normpath(CLOUD_ORGS_DIR)
+        except ValueError:
+            is_default_path = False  # e.g. different drive letters on Windows
+        target = os.path.dirname(repo_path) if is_default_path else repo_path
+        shutil.rmtree(target, ignore_errors=True)
 
 
 # ===================================================================================
@@ -389,11 +406,20 @@ def sync_cloud_org(org_id: str) -> dict:
     try:
         _run_git(["pull", "--ff-only"], cwd=org["local_repo_path"], timeout=120)
         pulled, warning = True, None
-    except ValueError as e:
+    except Exception as e:
+        # Deliberately broad, not just ValueError -- _run_git normalizes a
+        # non-zero git exit code to ValueError, but git itself not being
+        # resolvable (_resolve_executable raises RuntimeError), a timeout,
+        # or any other subprocess-level failure must be just as non-fatal
+        # here. This whole function's contract is "never blocks viewing
+        # whatever's already synced" -- letting anything else propagate up
+        # turned into a real bug: an unhandled exception here doesn't
+        # return JSON, it 500s, and the caller (e.g. the in-app editor's
+        # file listing) can't even show its own error message.
         pulled, warning = False, str(e)
     try:
         _run_git(["checkout", "HEAD", "--", "."], cwd=org["local_repo_path"], timeout=30)
-    except ValueError:
+    except Exception:
         pass  # e.g. brand new repo with no commits yet -- nothing to restore
     _sync_projects_from_manifest(org)
     return {"pulled": pulled, "warning": warning}
@@ -808,7 +834,7 @@ def remove_project(project_id: str):
             try:
                 _remove_manifest_entry(org, project["name"])
                 _git_commit_and_push(org, f"Remove project '{project['name']}'")
-            except ValueError:
+            except Exception:
                 pass  # best-effort -- a push failure here shouldn't block the local delete that already happened
 
 
@@ -1582,8 +1608,8 @@ def list_project_files(project_id: str) -> list[dict]:
     if org and org.get("mode") == "cloud":
         try:
             sync_cloud_org(org["id"])
-        except ValueError:
-            pass
+        except Exception:
+            pass  # defense in depth -- sync_cloud_org already swallows its own git failures
     root = project["project_root"]
     if not os.path.isdir(root):
         raise ValueError(
@@ -1619,10 +1645,23 @@ def list_project_files(project_id: str) -> list[dict]:
     return entries
 
 
+def _sync_cloud_project_best_effort(project: dict):
+    """Best-effort pull for a single project's org before a read/write --
+    never raises, since a sync hiccup shouldn't block reading/writing
+    whatever's already on disk. No-op for a Local org."""
+    org = get_org(project.get("org_id"))
+    if org and org.get("mode") == "cloud":
+        try:
+            sync_cloud_org(org["id"])
+        except Exception:
+            pass
+
+
 def read_project_file(project_id: str, relative_path: str) -> dict:
     project = get_project(project_id)
     if project is None:
         raise ValueError("unknown project_id")
+    _sync_cloud_project_best_effort(project)
     full_path = _resolve_editor_path(project, relative_path)
     if not os.path.isfile(full_path):
         raise ValueError("file does not exist")
@@ -1646,12 +1685,20 @@ def write_project_file(project_id: str, relative_path: str, content: str) -> dic
     half-written file; a save mid-apply could disagree with what the apply
     is already acting on), so this is "don't write while anything's
     reading," not just politeness. Can only edit a file that already exists
-    -- no file creation from here."""
+    -- no file creation from here.
+
+    For a Cloud org's project: pulls first (get the latest before writing
+    on top of it -- this doesn't attempt any real merge, just reduces the
+    window for clobbering someone else's more recent edit), then commits
+    and pushes the save immediately after writing. Both best-effort -- a
+    sync/push failure doesn't block the save that already landed on disk;
+    it's surfaced back to the caller as `sync_warning` instead."""
     if project_id in _active_run_by_project:
         raise ValueError("a run is currently in progress for this project -- wait for it to finish before saving")
     project = get_project(project_id)
     if project is None:
         raise ValueError("unknown project_id")
+    _sync_cloud_project_best_effort(project)
     full_path = _resolve_editor_path(project, relative_path)
     if not _editor_is_allowed_file(os.path.basename(full_path)):
         raise ValueError("this file type isn't editable here")
@@ -1659,7 +1706,21 @@ def write_project_file(project_id: str, relative_path: str, content: str) -> dic
         raise ValueError("file does not exist -- this editor can only edit existing files, not create new ones")
     with open(full_path, "w", encoding="utf-8", newline="") as f:
         f.write(content)
-    return {"ok": True, "path": relative_path.replace("\\", "/"), "size": os.path.getsize(full_path)}
+
+    sync_warning = None
+    org = get_org(project.get("org_id"))
+    if org and org.get("mode") == "cloud":
+        try:
+            _git_commit_and_push(org, f"Edit {relative_path.replace(chr(92), '/')} in '{project['name']}'")
+        except Exception as e:
+            sync_warning = f"Saved locally, but couldn't push to the repo: {e}"
+
+    return {
+        "ok": True,
+        "path": relative_path.replace("\\", "/"),
+        "size": os.path.getsize(full_path),
+        "sync_warning": sync_warning,
+    }
 
 
 # ===================================================================================

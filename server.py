@@ -108,7 +108,9 @@ async def list_organizations() -> list:
 
 
 @server.tool()
-async def add_organization(name: str, mode: str = "local", repo_url: str | None = None) -> dict:
+async def add_organization(
+    name: str, mode: str = "local", repo_url: str | None = None, clone_path: str | None = None
+) -> dict:
     """Create a new Organization. Projects are addressed as
     /<org-name>/<project-name>, so every project must belong to one --
     call this first if list_organizations came back empty.
@@ -119,9 +121,11 @@ async def add_organization(name: str, mode: str = "local", repo_url: str | None 
     else who creates an org with the SAME name and SAME repo_url ends up
     seeing the same projects. Relies entirely on git credentials already
     configured on this machine; repo_url must already be one you can
-    clone/push to."""
+    clone/push to. clone_path optionally picks where that clone lives on
+    disk (must be empty or not-yet-existing); left unset, it defaults to
+    cloud-orgs/<org_id>/repo next to this app."""
     try:
-        return await asyncio.to_thread(rm.add_org, name, mode, repo_url)
+        return await asyncio.to_thread(rm.add_org, name, mode, repo_url, clone_path)
     except ValueError as e:
         return {"error": str(e)}
 
@@ -1067,7 +1071,9 @@ async def api_add_org(request: Request):
         # add_org clones the repo for mode="cloud" -- a real network call,
         # so it runs off the event loop like any other git/terraform
         # subprocess call in this file.
-        org = await asyncio.to_thread(rm.add_org, body["name"], body.get("mode", "local"), body.get("repo_url"))
+        org = await asyncio.to_thread(
+            rm.add_org, body["name"], body.get("mode", "local"), body.get("repo_url"), body.get("clone_path")
+        )
         return JSONResponse(org)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
