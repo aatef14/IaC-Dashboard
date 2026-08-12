@@ -581,6 +581,135 @@ btnSyncCloudOrgEl.onclick = async () => {
   }
 };
 
+// ---------- local sync agent ("Sync to my computer") ----------
+// Talks DIRECTLY to a small local program (IaC-Dashboard Sync Agent)
+// listening on 127.0.0.1 -- a website's JS can't otherwise touch a
+// visitor's own disk, so this is the only way "Sync to my computer" can
+// mean anything real. Every control (repo/folder/when to sync) lives
+// here in the dashboard; the agent itself has no UI beyond printing its
+// pairing token once on startup.
+
+const AGENT_URL = "http://127.0.0.1:9876";
+const localSyncPanelEl = document.getElementById("local-sync-panel");
+
+function agentTokenKey(orgId) {
+  return `iac_agent_token_${orgId}`;
+}
+
+async function agentFetch(path, opts = {}) {
+  const res = await fetch(`${AGENT_URL}${path}`, opts);
+  const body = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(body.error || `agent HTTP ${res.status}`);
+  return body;
+}
+
+async function renderLocalSyncPanel(org) {
+  if (org.mode !== "cloud") {
+    localSyncPanelEl.classList.add("hidden");
+    localSyncPanelEl.innerHTML = "";
+    return;
+  }
+  localSyncPanelEl.classList.remove("hidden");
+
+  let status;
+  try {
+    status = await agentFetch("/status");
+  } catch (e) {
+    // Most common case: the agent just isn't running right now -- not an
+    // error to alarm over, just an offer to start it.
+    localSyncPanelEl.innerHTML = `
+      <div class="local-sync-box">
+        <span class="muted">Local Sync Agent not detected on this computer.</span>
+        <button id="btn-recheck-agent" class="btn">Check again</button>
+      </div>`;
+    document.getElementById("btn-recheck-agent").onclick = () => renderLocalSyncPanel(org);
+    return;
+  }
+
+  const token = localStorage.getItem(agentTokenKey(org.id));
+  const configuredForThisOrg = status.configured && status.repo_url === org.repo_url;
+
+  if (!configuredForThisOrg) {
+    localSyncPanelEl.innerHTML = `
+      <div class="local-sync-box">
+        <span class="muted">Agent detected. Set up syncing to a folder on this computer for this org:</span>
+        <label class="field-label">Agent token (printed in the agent's window)</label>
+        <input id="agent-token-input" placeholder="paste the token" value="${token ? escapeHtml(token) : ""}" />
+        <label class="field-label">Local folder</label>
+        <div class="confirm-row">
+          <input id="agent-local-dir-input" placeholder="C:\\path\\to\\local\\folder" />
+          <button id="btn-browse-agent-folder" class="btn">Browse&hellip;</button>
+        </div>
+        <button id="btn-start-agent-sync" class="btn primary full-width">Start Syncing</button>
+        <div id="agent-setup-error" class="warn-text hidden"></div>
+      </div>`;
+
+    const tokenInput = document.getElementById("agent-token-input");
+    const dirInput = document.getElementById("agent-local-dir-input");
+    const errEl = document.getElementById("agent-setup-error");
+
+    document.getElementById("btn-browse-agent-folder").onclick = async () => {
+      errEl.classList.add("hidden");
+      const t = tokenInput.value.trim();
+      if (!t) { errEl.textContent = "Paste the agent token first."; errEl.classList.remove("hidden"); return; }
+      try {
+        const { path } = await agentFetch("/browse-folder", { method: "POST", headers: { Authorization: `Bearer ${t}` } });
+        if (path) dirInput.value = path;
+      } catch (e2) {
+        errEl.textContent = e2.message;
+        errEl.classList.remove("hidden");
+      }
+    };
+
+    document.getElementById("btn-start-agent-sync").onclick = async () => {
+      errEl.classList.add("hidden");
+      const t = tokenInput.value.trim();
+      const dir = dirInput.value.trim();
+      if (!t || !dir) {
+        errEl.textContent = "Enter the token and pick a local folder.";
+        errEl.classList.remove("hidden");
+        return;
+      }
+      try {
+        await agentFetch("/configure", {
+          method: "POST",
+          headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
+          body: JSON.stringify({ repo_url: org.repo_url, local_dir: dir }),
+        });
+        localStorage.setItem(agentTokenKey(org.id), t);
+        toast("Local sync set up.", { type: "success" });
+        renderLocalSyncPanel(org);
+      } catch (e2) {
+        errEl.textContent = e2.message;
+        errEl.classList.remove("hidden");
+      }
+    };
+    return;
+  }
+
+  const lastSynced = status.last_synced_at ? fmtRelative(status.last_synced_at) : "never";
+  localSyncPanelEl.innerHTML = `
+    <div class="local-sync-box">
+      <span class="muted">Synced to <code>${escapeHtml(status.local_dir)}</code> on this computer. Last synced: ${escapeHtml(lastSynced)}.</span>
+      <button id="btn-sync-to-computer" class="btn">&#8635; Sync to my computer</button>
+    </div>`;
+  document.getElementById("btn-sync-to-computer").onclick = async () => {
+    const btn = document.getElementById("btn-sync-to-computer");
+    btn.disabled = true;
+    try {
+      const result = await agentFetch("/sync", { method: "POST", headers: { Authorization: `Bearer ${token}` } });
+      toast(result.warning ? `Synced with a warning: ${result.warning}` : "Synced to your computer.", {
+        type: result.warning ? "warning" : "success",
+      });
+      renderLocalSyncPanel(org);
+    } catch (e2) {
+      toast(`Sync failed: ${e2.message}`, { type: "error", duration: 7000 });
+    } finally {
+      btn.disabled = false;
+    }
+  };
+}
+
 async function showOrgView(org, { pushHistory = true } = {}) {
   currentOrg = org;
   currentProject = null;
@@ -606,6 +735,7 @@ async function showOrgView(org, { pushHistory = true } = {}) {
   }
 
   await syncCloudOrg(org);
+  renderLocalSyncPanel(org); // best-effort, doesn't block the rest of the page on the agent probe
   await refreshProjects();
 }
 
