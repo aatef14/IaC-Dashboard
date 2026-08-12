@@ -600,14 +600,16 @@ _COPY_ICON_SVG = (
 
 
 def _device_login_html(pending: dict | None) -> str:
-    """Two-stage page: a plain "Sign in with GitHub" landing state (no
-    device code minted yet -- clicking the button calls /auth/device/start),
-    and an in-progress state with the code + copy button + poll loop, shown
-    directly on load if `pending` (an already in-flight login) is passed."""
+    """Two-stage page: a plain "Login with GitHub" landing state (no device
+    code minted yet -- clicking the button calls /auth/device/start), and
+    an in-progress state with the code + expiry countdown + poll loop,
+    shown directly on load if `pending` (an already in-flight login) is
+    passed."""
     has_pending = pending is not None
     user_code = pending["user_code"] if pending else ""
     verification_uri = pending["verification_uri"] if pending else ""
     poll_ms = max(pending["interval"], 3) * 1000 if pending else 5000
+    expires_at = pending["expires_at"] if pending else 0
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>Sign in with GitHub</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpolyline points='9,10 16,16 9,22' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3Crect x='18' y='20' width='7' height='3' rx='1' fill='white'/%3E%3C/svg%3E" />
@@ -617,9 +619,10 @@ def _device_login_html(pending: dict | None) -> str:
           color:#e7e7ec; display:flex; align-items:center; justify-content:center; min-height:100vh; margin:0; padding:20px; }}
   .card {{ background:#151b2c; border:1px solid #262f47; border-radius:16px; padding:40px 40px 34px;
            text-align:center; max-width:400px; width:100%; box-shadow: 0 20px 60px rgba(0,0,0,0.45); }}
-  .brand {{ font-size:13px; font-weight:700; letter-spacing:0.06em; color:#5b8def; text-transform:uppercase; margin-bottom:22px; }}
-  h1 {{ font-size:19px; font-weight:650; margin:0 0 8px; color:#eef1f8; }}
-  p.sub {{ font-size:13px; color:#8b93ab; margin:0 0 28px; line-height:1.5; }}
+  .app-title {{ font-size:24px; font-weight:750; margin:0 0 4px; color:#eef1f8; letter-spacing:-0.01em; }}
+  .tagline {{ font-size:13px; color:#5b8def; font-weight:600; margin:0 0 28px; }}
+  h1 {{ font-size:16px; font-weight:650; margin:0 0 8px; color:#eef1f8; }}
+  p.sub {{ font-size:13px; color:#8b93ab; margin:0 0 24px; line-height:1.5; }}
   .btn-github {{ display:flex; align-items:center; justify-content:center; gap:10px; width:100%;
            background:#1f2733; color:#fff; border:1px solid #333f56; text-decoration:none;
            padding:12px 20px; border-radius:10px; font-weight:600; font-size:14px; cursor:pointer;
@@ -629,7 +632,7 @@ def _device_login_html(pending: dict | None) -> str:
            padding:12px 20px; border-radius:10px; font-weight:650; font-size:14px; margin-bottom:16px;
            transition: background 0.15s ease; }}
   a.btn-primary:hover {{ background:#1d4ed8; }}
-  .code-row {{ display:flex; align-items:stretch; gap:8px; margin-bottom:22px; }}
+  .code-row {{ display:flex; align-items:stretch; gap:8px; margin-bottom:10px; }}
   .code {{ flex:1; font-size:28px; font-weight:700; letter-spacing:4px; background:#0d121f;
            border:1px solid #262f47; border-radius:10px; padding:14px 6px; font-family: ui-monospace, "SF Mono", Consolas, monospace; }}
   .btn-copy {{ flex-shrink:0; width:44px; background:#1f2733; border:1px solid #333f56; border-radius:10px;
@@ -637,6 +640,8 @@ def _device_login_html(pending: dict | None) -> str:
            transition: background 0.15s ease, color 0.15s ease; }}
   .btn-copy:hover {{ background:#28324450; color:#fff; }}
   .btn-copy.copied {{ color:#34d399; border-color:#1c5f47; }}
+  #expiry {{ font-size:12px; color:#6b7590; margin-bottom:18px; }}
+  #expiry.soon {{ color:#e5a53f; }}
   #status {{ font-size:13px; color:#7c8499; }}
   #status.err {{ color:#f28b8b; }}
   .hidden {{ display:none; }}
@@ -646,12 +651,12 @@ def _device_login_html(pending: dict | None) -> str:
 </style></head>
 <body>
   <div class="card">
-    <div class="brand">IaC-Dashboard</div>
+    <div class="app-title">IaC-Dashboard</div>
+    <div class="tagline">Your IaC Management Tool</div>
 
     <div id="stage-login" class="{'hidden' if has_pending else ''}">
-      <h1>Sign in required</h1>
-      <p class="sub">This dashboard can run real Terraform changes and open a real shell -- sign in with GitHub to continue.</p>
-      <button id="btn-start" class="btn-github">{_GITHUB_MARK_SVG}<span>Sign in with GitHub</span></button>
+      <p class="sub">Sign in with GitHub to continue.</p>
+      <button id="btn-start" class="btn-github">{_GITHUB_MARK_SVG}<span>Login with GitHub</span></button>
     </div>
 
     <div id="stage-code" class="{'' if has_pending else 'hidden'}">
@@ -661,6 +666,7 @@ def _device_login_html(pending: dict | None) -> str:
         <div class="code" id="code-text">{user_code}</div>
         <button id="btn-copy" class="btn-copy" title="Copy code">{_COPY_ICON_SVG}</button>
       </div>
+      <div id="expiry"></div>
       <a id="link-github" class="btn-primary" href="{verification_uri}" target="_blank" rel="noopener">Open GitHub &amp; enter code</a>
       <div id="status"><span class="spinner"></span>Waiting for approval&hellip;</div>
     </div>
@@ -672,7 +678,30 @@ def _device_login_html(pending: dict | None) -> str:
     const codeTextEl = document.getElementById("code-text");
     const linkEl = document.getElementById("link-github");
     const copyBtn = document.getElementById("btn-copy");
+    const expiryEl = document.getElementById("expiry");
     let nextDelayMs = {poll_ms};
+    let expiresAt = {expires_at};
+    let expiryTimer = null;
+
+    function startExpiryCountdown() {{
+      if (expiryTimer) clearInterval(expiryTimer);
+      function tick() {{
+        const remaining = expiresAt - Math.floor(Date.now() / 1000);
+        if (remaining <= 0) {{
+          expiryEl.textContent = "Code expired";
+          expiryEl.classList.add("soon");
+          clearInterval(expiryTimer);
+          return;
+        }}
+        const m = Math.floor(remaining / 60);
+        const s = remaining % 60;
+        expiryEl.textContent = `Expires in ${{m}}:${{String(s).padStart(2, "0")}}`;
+        expiryEl.classList.toggle("soon", remaining < 60);
+      }}
+      tick();
+      expiryTimer = setInterval(tick, 1000);
+    }}
+    if (expiresAt > 0) startExpiryCountdown();
 
     copyBtn.onclick = async () => {{
       try {{
@@ -717,6 +746,8 @@ def _device_login_html(pending: dict | None) -> str:
         stageLogin.classList.add("hidden");
         stageCode.classList.remove("hidden");
         nextDelayMs = Math.max(body.interval, 3) * 1000;
+        expiresAt = body.expires_at;
+        startExpiryCountdown();
         setTimeout(poll, nextDelayMs);
       }} catch (e) {{
         statusEl.textContent = "Could not reach the server.";
@@ -752,7 +783,12 @@ async def auth_device_start(request: Request):
     pending = ghauth.read_device_pending_cookie(request.cookies.get(ghauth.DEVICE_PENDING_COOKIE))
     if pending:
         return JSONResponse(
-            {"user_code": pending["user_code"], "verification_uri": pending["verification_uri"], "interval": pending["interval"]}
+            {
+                "user_code": pending["user_code"],
+                "verification_uri": pending["verification_uri"],
+                "interval": pending["interval"],
+                "expires_at": pending["expires_at"],
+            }
         )
 
     try:
@@ -765,7 +801,9 @@ async def auth_device_start(request: Request):
         return JSONResponse({"error": f"could not start GitHub sign-in: {e}"}, status_code=502)
 
     expires_at = int(time.time()) + expires_in
-    resp = JSONResponse({"user_code": user_code, "verification_uri": verification_uri, "interval": interval})
+    resp = JSONResponse(
+        {"user_code": user_code, "verification_uri": verification_uri, "interval": interval, "expires_at": expires_at}
+    )
     resp.set_cookie(
         ghauth.DEVICE_PENDING_COOKIE,
         ghauth.create_device_pending_cookie_value(device["device_code"], user_code, verification_uri, interval, expires_at),
