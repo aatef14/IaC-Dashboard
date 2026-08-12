@@ -45,6 +45,8 @@ const btnScanEl = document.getElementById("btn-scan");
 const btnInitializeFolderEl = document.getElementById("btn-initialize-folder");
 const newFolderHintEl = document.getElementById("new-folder-hint");
 const deploymentSelectBoxEl = document.getElementById("deployment-select-box");
+const folderPickerSectionEl = document.getElementById("folder-picker-section");
+const cloudProjectHintEl = document.getElementById("cloud-project-hint");
 const deploymentSelectEl = document.getElementById("deployment-select");
 const environmentSelectEl = document.getElementById("environment-select");
 const addProjectErrorEl = document.getElementById("add-project-error");
@@ -1274,6 +1276,12 @@ function setFolderMode(mode) {
 tabExistingFolderEl.onclick = () => setFolderMode("existing");
 tabNewFolderEl.onclick = () => setFolderMode("new");
 
+// Cloud org project creation skips the folder picker entirely -- name it,
+// and create_cloud_project scaffolds <repo>/<name>/ automatically (see
+// README's "Cloud organizations" section for why: the folder is never a
+// real choice for a Cloud org, there's exactly one right answer).
+let isCloudCreateMode = false;
+
 btnAddProjectEl.onclick = () => {
   editingProjectId = null;
   addProjectModalTitleEl.textContent = "Add Work Project";
@@ -1281,20 +1289,39 @@ btnAddProjectEl.onclick = () => {
   projectNameInputEl.value = "";
   projectNameInputEl.disabled = false;
   projectNameInputEl.title = "";
-  // Pre-fills from this org's last-browsed path (see btnBrowseEl.onclick)
-  // instead of always starting blank -- most useful when an org's
-  // projects live under one shared parent repo/client folder.
-  projectRootInputEl.value = (currentOrg && currentOrg.last_browsed_path) || "";
   retentionDaysInputEl.value = "";
-  tabExistingFolderEl.classList.remove("hidden");
-  tabNewFolderEl.classList.remove("hidden");
-  document.getElementById("folder-mode-tabs").classList.remove("hidden");
-  setFolderMode("existing");
+  addProjectErrorEl.classList.add("hidden");
+
+  isCloudCreateMode = !!(currentOrg && currentOrg.mode === "cloud");
+  cloudProjectHintEl.classList.toggle("hidden", !isCloudCreateMode);
+  folderPickerSectionEl.classList.toggle("hidden", isCloudCreateMode);
+
+  if (isCloudCreateMode) {
+    btnCreateProjectEl.disabled = true; // re-enabled by the name-input listener below once non-empty
+  } else {
+    // Pre-fills from this org's last-browsed path (see btnBrowseEl.onclick)
+    // instead of always starting blank -- most useful when an org's
+    // projects live under one shared parent repo/client folder.
+    projectRootInputEl.value = (currentOrg && currentOrg.last_browsed_path) || "";
+    tabExistingFolderEl.classList.remove("hidden");
+    tabNewFolderEl.classList.remove("hidden");
+    document.getElementById("folder-mode-tabs").classList.remove("hidden");
+    setFolderMode("existing");
+  }
   openModal(addProjectModalEl);
 };
 
+projectNameInputEl.addEventListener("input", () => {
+  if (isCloudCreateMode && !editingProjectId) {
+    btnCreateProjectEl.disabled = !projectNameInputEl.value.trim();
+  }
+});
+
 async function openEditProjectModal(project) {
   editingProjectId = project.id;
+  isCloudCreateMode = false; // editing always uses the full folder picker, even for a Cloud org project
+  cloudProjectHintEl.classList.add("hidden");
+  folderPickerSectionEl.classList.remove("hidden");
   addProjectModalTitleEl.textContent = `Edit "${project.name}"`;
   btnCreateProjectEl.textContent = "Save Changes";
   projectNameInputEl.value = project.name;
@@ -1409,6 +1436,35 @@ deploymentSelectEl.onchange = updateEnvironmentOptions;
 
 btnCreateProjectEl.onclick = async () => {
   addProjectErrorEl.classList.add("hidden");
+
+  if (!editingProjectId && isCloudCreateMode) {
+    const name = projectNameInputEl.value.trim();
+    if (!name) { showAddProjectError("Give this project a name."); return; }
+    const cloudRetentionRaw = retentionDaysInputEl.value.trim();
+    let retentionDays = null;
+    if (cloudRetentionRaw !== "") {
+      const n = Number(cloudRetentionRaw);
+      if (!Number.isInteger(n) || n < 0) {
+        showAddProjectError("Run retention must be a whole number of days (blank = keep forever).");
+        return;
+      }
+      retentionDays = n;
+    }
+    try {
+      const project = await api(`/api/organizations/${currentOrg.id}/cloud-project`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, retention_days: retentionDays }),
+      });
+      closeModals();
+      await openWorkspace(project);
+      runInit(); // same as the non-cloud "brand-new project" path below
+    } catch (e) {
+      showAddProjectError(e.message);
+    }
+    return;
+  }
+
   const projectRoot = projectRootInputEl.value.trim();
   const deployment = deploymentSelectEl.value;
   const environment = environmentSelectEl.value;

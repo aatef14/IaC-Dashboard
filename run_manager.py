@@ -385,6 +385,34 @@ def sync_cloud_org(org_id: str) -> dict:
     return {"pulled": pulled, "warning": warning}
 
 
+def create_cloud_project(org_id: str, name: str, retention_days: int | None = None) -> dict:
+    """The Cloud-org fast path for Add Work Project: name it, and the
+    dashboard scaffolds <repo>/<name>/ (modules/ + tf-deployment/)
+    automatically -- no folder picker, no "select existing folder" option.
+    Always a fresh scaffold (REPLACE_ME placeholders you still fill in
+    yourself before terraform init/plan will actually work) -- same as
+    "Initialize new folder" has always been, this just skips choosing
+    WHERE, since for a Cloud org there's only ever one right answer."""
+    org = get_org(org_id)
+    if org is None:
+        raise ValueError("unknown org_id -- create an organization first")
+    if org.get("mode") != "cloud":
+        raise ValueError("create_cloud_project is only for Cloud organizations")
+
+    name = _validate_name(name, "project")
+    if name in (".", "..") or "/" in name or "\\" in name:
+        raise ValueError("project name can't contain '/' or '\\\\' -- it's used directly as the folder name in the repo")
+
+    project_root = os.path.join(org["local_repo_path"], name)
+    if os.path.exists(project_root):
+        raise ValueError(f"'{name}' already exists in this repo -- pick a different name")
+
+    os.makedirs(project_root)
+    discovered = initialize_project_folder(project_root)
+    dep = discovered["deployments"][0]
+    return add_project(org_id, name, project_root, dep["name"], dep["environments"][0], retention_days=retention_days)
+
+
 def check_project_root_for_org(org_id: str, project_root: str):
     """Public wrapper for _require_project_root_under_cloud_repo -- lets
     server.py validate at the "Initialize new folder" scaffold step too

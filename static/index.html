@@ -333,26 +333,35 @@
       <label class="field-label">Name</label>
       <input id="project-name-input" placeholder="e.g. QISP-RAG-sandbox (no spaces)" />
 
-      <div id="folder-mode-tabs" class="tabs">
-        <button type="button" id="tab-existing-folder" class="tab active" data-mode="existing">Select existing folder</button>
-        <button type="button" id="tab-new-folder" class="tab" data-mode="new">Initialize new folder</button>
-      </div>
+      <p id="cloud-project-hint" class="muted hidden">This organization's projects live in its repo -- creating this
+        project will make a <code>&lt;name&gt;/</code> folder there automatically, with a starter
+        <code>modules/</code> + <code>tf-deployment/</code> (main.tf, backend/, environmentVariables/) inside it. It's
+        committed and pushed as soon as you create it -- you'll still need to fill in real values (subscription id,
+        resource group, etc.) in place of the <code>REPLACE_ME</code> placeholders before <code>terraform init</code>
+        will work.</p>
 
-      <label class="field-label" id="project-root-label">Project folder</label>
-      <div class="confirm-row">
-        <input id="project-root-input" placeholder="C:\path\to\IAC" />
-        <button id="btn-browse" class="btn">Browse&hellip;</button>
-      </div>
-      <p id="new-folder-hint" class="muted hidden">Pick an EMPTY folder — this will create <code>modules/</code> and a starter
-        <code>tf-deployment/</code> (main.tf, backend/, environmentVariables/) inside it, using the cloud provider selected above.</p>
-      <button id="btn-scan" class="btn full-width">Scan Folder</button>
-      <button id="btn-initialize-folder" class="btn full-width hidden">Initialize Folder</button>
+      <div id="folder-picker-section">
+        <div id="folder-mode-tabs" class="tabs">
+          <button type="button" id="tab-existing-folder" class="tab active" data-mode="existing">Select existing folder</button>
+          <button type="button" id="tab-new-folder" class="tab" data-mode="new">Initialize new folder</button>
+        </div>
 
-      <div id="deployment-select-box" class="hidden">
-        <label class="field-label">Deployment</label>
-        <select id="deployment-select"></select>
-        <label class="field-label">Environment</label>
-        <select id="environment-select"></select>
+        <label class="field-label" id="project-root-label">Project folder</label>
+        <div class="confirm-row">
+          <input id="project-root-input" placeholder="C:\path\to\IAC" />
+          <button id="btn-browse" class="btn">Browse&hellip;</button>
+        </div>
+        <p id="new-folder-hint" class="muted hidden">Pick an EMPTY folder — this will create <code>modules/</code> and a starter
+          <code>tf-deployment/</code> (main.tf, backend/, environmentVariables/) inside it, using the cloud provider selected above.</p>
+        <button id="btn-scan" class="btn full-width">Scan Folder</button>
+        <button id="btn-initialize-folder" class="btn full-width hidden">Initialize Folder</button>
+
+        <div id="deployment-select-box" class="hidden">
+          <label class="field-label">Deployment</label>
+          <select id="deployment-select"></select>
+          <label class="field-label">Environment</label>
+          <select id="environment-select"></select>
+        </div>
       </div>
 
       <label class="field-label">Run retention (days)</label>
