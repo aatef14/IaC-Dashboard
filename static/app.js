@@ -20,6 +20,7 @@ const projectsGridEl = document.getElementById("projects-grid");
 const noProjectsMsgEl = document.getElementById("no-projects-msg");
 const btnHowToUseEl = document.getElementById("btn-how-to-use");
 const btnAddProjectEl = document.getElementById("btn-add-project");
+const btnSyncCloudOrgEl = document.getElementById("btn-sync-cloud-org");
 
 const modalOverlayEl = document.getElementById("modal-overlay");
 const howToUseModalEl = document.getElementById("how-to-use-modal");
@@ -551,6 +552,33 @@ function showToolsView({ pushHistory = true } = {}) {
 
 // ---------- org view (work projects inside one organization) ----------
 
+// Shared between the automatic sync-on-open (showOrgView) and the manual
+// "Sync now" button -- same call, same error handling either way. No-op
+// server-side for a Local org. Best-effort -- a pull failure (no network,
+// no credentials) is surfaced as a toast, not a blocking error, since
+// whatever synced previously is still viewable.
+async function syncCloudOrg(org) {
+  if (org.mode !== "cloud") return;
+  try {
+    const result = await api(`/api/organizations/${org.id}/sync`, { method: "POST" });
+    if (result.warning) toast(`Cloud sync: ${result.warning}`, { type: "warning", duration: 7000 });
+  } catch (e) {
+    toast(`Cloud sync failed: ${e.message}`, { type: "warning", duration: 7000 });
+  }
+}
+
+btnSyncCloudOrgEl.onclick = async () => {
+  if (!currentOrg) return;
+  btnSyncCloudOrgEl.disabled = true;
+  try {
+    await syncCloudOrg(currentOrg);
+    await refreshProjects();
+    toast("Synced.", { type: "success", duration: 2500 });
+  } finally {
+    btnSyncCloudOrgEl.disabled = false;
+  }
+};
+
 async function showOrgView(org, { pushHistory = true } = {}) {
   currentOrg = org;
   currentProject = null;
@@ -568,26 +596,14 @@ async function showOrgView(org, { pushHistory = true } = {}) {
   btnBackEl.textContent = "←";
   orgViewNameEl.textContent = org.name;
   document.title = `${org.name} — IaC-Dashboard`;
+  btnSyncCloudOrgEl.classList.toggle("hidden", org.mode !== "cloud");
 
   if (pushHistory) {
     const url = `/${encodeURIComponent(org.name)}`;
     if (location.pathname !== url) history.pushState({ orgId: org.id }, "", url);
   }
 
-  // Cloud org: pull the latest from its repo before showing projects, so
-  // anything a collaborator pushed shows up without a manual refresh.
-  // No-op server-side for a Local org. Best-effort -- a pull failure (no
-  // network, no credentials) is surfaced as a toast, not a blocking error,
-  // since whatever synced previously is still viewable.
-  if (org.mode === "cloud") {
-    try {
-      const result = await api(`/api/organizations/${org.id}/sync`, { method: "POST" });
-      if (result.warning) toast(`Cloud sync: ${result.warning}`, { type: "warning", duration: 7000 });
-    } catch (e) {
-      toast(`Cloud sync failed: ${e.message}`, { type: "warning", duration: 7000 });
-    }
-  }
-
+  await syncCloudOrg(org);
   await refreshProjects();
 }
 

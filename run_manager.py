@@ -370,7 +370,17 @@ def sync_cloud_org(org_id: str) -> dict:
     someone else pushed -- called when opening a Cloud org's page. A pull
     failure (no network, no credentials) is reported back rather than
     raised, since it shouldn't block viewing whatever was already synced
-    locally."""
+    locally.
+
+    Also force-restores the working tree to match HEAD (`git checkout --
+    .`) regardless of whether the pull actually moved HEAD -- `git pull`
+    only fetches NEW commits, it does nothing if a tracked file went
+    missing locally (deleted by hand, a partial/interrupted clone, disk
+    issue) while the branch is otherwise already up to date. Safe here
+    specifically because this clone exists ONLY for the dashboard's own
+    automated reads/writes, which always commit+push immediately -- unlike
+    a normal working repo, there's never a real uncommitted edit here to
+    lose."""
     org = get_org(org_id)
     if org is None:
         raise ValueError("unknown org_id")
@@ -381,6 +391,10 @@ def sync_cloud_org(org_id: str) -> dict:
         pulled, warning = True, None
     except ValueError as e:
         pulled, warning = False, str(e)
+    try:
+        _run_git(["checkout", "HEAD", "--", "."], cwd=org["local_repo_path"], timeout=30)
+    except ValueError:
+        pass  # e.g. brand new repo with no commits yet -- nothing to restore
     _sync_projects_from_manifest(org)
     return {"pulled": pulled, "warning": warning}
 
@@ -1551,13 +1565,34 @@ def list_project_files(project_id: str) -> list[dict]:
     _editor_allowed_roots (not the whole project_root -- see that
     function). Lists everything in those folders except _EDITOR_SKIP_DIRS,
     and marks which entries this editor will actually open (`editable`) so
-    the UI can grey out lockfiles/binaries instead of hiding them outright."""
+    the UI can grey out lockfiles/binaries instead of hiding them outright.
+
+    For a Cloud org's project, syncs (pulls) first -- sync otherwise only
+    happens when opening the org's project grid page, so a project opened
+    via any other path (a direct/bookmarked editor URL, or just not having
+    revisited the grid since someone else pushed) could hit a genuinely
+    stale or even not-yet-cloned local copy. Making the editor's own read
+    path always sync first means it can't go stale no matter how you got
+    here. Best-effort -- a pull failure (no network) doesn't block reading
+    whatever's already on disk."""
     project = get_project(project_id)
     if project is None:
         raise ValueError("unknown project_id")
+    org = get_org(project.get("org_id"))
+    if org and org.get("mode") == "cloud":
+        try:
+            sync_cloud_org(org["id"])
+        except ValueError:
+            pass
     root = project["project_root"]
     if not os.path.isdir(root):
-        raise ValueError("project folder does not exist on disk")
+        raise ValueError(
+            "project folder does not exist on disk -- this project's org is a Cloud org and syncing "
+            "just ran but still didn't produce this folder. Check that the project was actually pushed "
+            "(ask whoever created it), or that this repo clone succeeded."
+            if org and org.get("mode") == "cloud"
+            else "project folder does not exist on disk"
+        )
 
     entries = []
     for allowed_root in _editor_allowed_roots(project):
