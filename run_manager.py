@@ -145,6 +145,21 @@ def get_org(org_id: str) -> dict | None:
     return next((o for o in orgs if o["id"] == org_id), None)
 
 
+def set_org_last_browsed_path(org_id: str, path: str):
+    """Remembers the last folder browsed for this org, so the next "Add
+    Work Project" for it can start the folder picker there instead of
+    wherever the OS defaults to. Purely a convenience hint -- never
+    authoritative, since a project's own project_root is independent and
+    can point anywhere regardless of what its org last browsed to."""
+    with _orgs_lock:
+        orgs = _load_orgs()
+        org = next((o for o in orgs if o["id"] == org_id), None)
+        if org is None:
+            return  # org was deleted mid-flight -- nothing to remember it for
+        org["last_browsed_path"] = path
+        _save_orgs(orgs)
+
+
 def remove_org(org_id: str):
     """Delete an organization and cascade-delete every project inside it
     (each via remove_project, so run history/plan data is cleaned up the
@@ -405,6 +420,12 @@ def add_project(
         projects.append(project)
         _save_projects(projects)
 
+    # Also remember this org's folder even when project_root was typed
+    # directly rather than picked via the Browse dialog (which is the
+    # other place this gets set) -- either path should teach the org
+    # where its projects tend to live.
+    set_org_last_browsed_path(org_id, discovered["project_root"])
+
     return project
 
 
@@ -529,6 +550,10 @@ def update_project(
         projects = _load_projects()
         projects = [updated if p["id"] == project_id else p for p in projects]
         _save_projects(projects)
+
+    # Same reasoning as add_project: editing a project's folder is just as
+    # strong a signal of "this org's stuff lives here now" as creating one.
+    set_org_last_browsed_path(updated["org_id"], discovered["project_root"])
 
     return updated
 
@@ -943,6 +968,204 @@ def get_module_and_provider_sources(project_id: str) -> dict:
                         }
                     )
     return {"modules": modules, "providers": providers}
+
+
+# ===================================================================================
+# DEPENDENCY GRAPH
+# ===================================================================================
+
+# One style per rough resource category, chosen for legibility against the
+# fixed dark panel this renders into (same "theme-independent" reasoning as
+# #log's own fixed navy background elsewhere in this app -- a graph this
+# colour-coded would need two full palettes to stay legible in both a light
+# and dark host page, so it gets its own permanently-dark canvas instead).
+_GRAPH_CATEGORY_STYLES = {
+    "data": {"fillcolor": "#334155", "color": "#64748b", "fontcolor": "#cbd5e1"},
+    "identity": {"fillcolor": "#065f46", "color": "#10b981", "fontcolor": "#d1fae5"},
+    "network": {"fillcolor": "#4c1d95", "color": "#a78bfa", "fontcolor": "#ede9fe"},
+    "storage_data": {"fillcolor": "#1e3a8a", "color": "#60a5fa", "fontcolor": "#dbeafe"},
+    "compute_ai": {"fillcolor": "#78350f", "color": "#fbbf24", "fontcolor": "#fef3c7"},
+    "utility": {"fillcolor": "#701a4f", "color": "#f472b6", "fontcolor": "#fce7f3"},
+    "other": {"fillcolor": "#334155", "color": "#94a3b8", "fontcolor": "#e2e8f0"},
+}
+
+
+def _classify_graph_node(node_id: str) -> str:
+    """Buckets a graph node by what kind of thing it represents, purely
+    from keywords in its terraform address -- good enough for a quick
+    visual "what category is this" without needing real provider schema."""
+    label = node_id.lower()
+    if label.startswith("data.") or ".data." in label:
+        return "data"
+    if "role_assignment" in label or "user_assigned_identity" in label:
+        return "identity"
+    if any(k in label for k in ("network", "subnet", "private_endpoint", "virtual_network", "dns_zone")):
+        return "network"
+    if any(k in label for k in ("storage_account", "key_vault", "cosmosdb", "_database", "_sql")):
+        return "storage_data"
+    if any(
+        k in label
+        for k in ("cognitive", "search_service", "service_plan", "linux_web_app", "windows_web_app", "container", "function_app")
+    ):
+        return "compute_ai"
+    if "time_static" in label or "null_resource" in label:
+        return "utility"
+    return "other"
+
+
+_GRAPH_NODE_LINE_RE = re.compile(r'^\s*"([^"]+)"\s*\[label=', re.MULTILINE)
+_GRAPH_CLUSTER_OPEN_RE = re.compile(r'(subgraph\s+"cluster_[^"]+"\s*\{)')
+_GRAPH_EDGE_RE = re.compile(r'^\s*"([^"]+)"\s*->\s*"([^"]+)"\s*;', re.MULTILINE)
+_GRAPH_MODULE_PREFIX_RE = re.compile(r"^(module\.[^.]+)\.")
+
+
+def _collapse_to_module(node_id: str) -> str:
+    """'module.foo.azurerm_x.y' -> 'module.foo'; anything not inside a
+    module (root resources/data sources) passes through unchanged."""
+    m = _GRAPH_MODULE_PREFIX_RE.match(node_id)
+    return m.group(1) if m else node_id
+
+
+def _build_module_level_graph_dot(dot_source: str) -> str:
+    """A real deployment's per-resource graph (dozens of resources, dense
+    cross-module dependencies) reads as a hairball -- this collapses every
+    resource inside a module.* into ONE node representing that module,
+    answering "what depends on what" at a scale that's actually readable.
+    Builds a fresh, minimal DOT from scratch (just the collapsed node/edge
+    set) rather than patching terraform's original -- there's no cluster
+    structure left to preserve once modules themselves become the nodes."""
+    node_ids = set(_GRAPH_NODE_LINE_RE.findall(dot_source))
+    edges = _GRAPH_EDGE_RE.findall(dot_source)
+
+    collapsed_nodes = {_collapse_to_module(n) for n in node_ids}
+    collapsed_edges = set()
+    for a, b in edges:
+        ca, cb = _collapse_to_module(a), _collapse_to_module(b)
+        if ca != cb:  # an edge between two resources in the SAME module disappears once collapsed
+            collapsed_edges.add((ca, cb))
+
+    # Data sources and ordering-helper resources (time_static, null_resource)
+    # are plumbing/lookups, not part of the "what infrastructure depends on
+    # what" story this view exists to answer -- dropping them (and every
+    # edge touching them) is most of what actually makes the graph simpler,
+    # on top of the module-collapsing above.
+    def _is_noise(node_id):
+        return not node_id.startswith("module.") and _classify_graph_node(node_id) in ("data", "utility")
+
+    collapsed_nodes = {n for n in collapsed_nodes if not _is_noise(n)}
+    collapsed_edges = {(a, b) for a, b in collapsed_edges if not _is_noise(a) and not _is_noise(b)}
+
+    lines = [
+        "digraph G {",
+        '  rankdir = "LR";',
+        '  bgcolor = "transparent";',
+        '  splines = "line";',
+        "  concentrate = true;",
+        "  nodesep = 0.45;",
+        "  ranksep = 0.7;",
+        '  node [shape=rect, style="filled,rounded", fontname="Segoe UI, sans-serif", '
+        'fontsize=12, margin="0.22,0.14", penwidth=1.4];',
+        '  edge [color="#7c8db588", arrowsize=0.8, penwidth=1.5];',
+    ]
+    for node_id in sorted(collapsed_nodes):
+        # Modules get their own consistent look (rather than whatever
+        # category their first resource happened to be) so the "these are
+        # the grouping boxes" visual language stays consistent regardless
+        # of what's inside each one.
+        style = _GRAPH_CATEGORY_STYLES["network"] if node_id.startswith("module.") else _GRAPH_CATEGORY_STYLES[_classify_graph_node(node_id)]
+        escaped = node_id.replace('"', '\\"')
+        lines.append(f'  "{escaped}" [label="{escaped}", fillcolor="{style["fillcolor"]}", color="{style["color"]}", fontcolor="{style["fontcolor"]}"];')
+    for a, b in sorted(collapsed_edges):
+        escaped_a = a.replace('"', '\\"')
+        escaped_b = b.replace('"', '\\"')
+        lines.append(f'  "{escaped_a}" -> "{escaped_b}";')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+def _style_dependency_graph_dot(dot_source: str) -> str:
+    """Takes terraform graph's plain black-and-white DOT output and layers
+    styling on top: transparent background, rounded/filled nodes colour-
+    coded by _classify_graph_node, softly-tinted rounded module clusters,
+    and a left-to-right layout (reads better than terraform's default
+    right-to-left in a wide browser panel). Done by string/regex
+    insertion rather than a full DOT parser -- appending an extra
+    attribute statement for a node Graphviz already knows about merges
+    with (doesn't replace) its earlier `label=...` attribute, so this
+    never has to touch terraform's own structure/edges/labels, only add
+    to them. If terraform's output format ever shifts enough that the
+    anchor strings below don't match, the .replace() calls are no-ops --
+    this degrades to an unstyled-but-still-correct graph, never an error."""
+    dot_source = dot_source.replace('rankdir = "RL";', 'rankdir = "LR";')
+    dot_source = dot_source.replace(
+        'node [shape = rect, fontname = "sans-serif"];',
+        'node [shape = rect, fontname = "Segoe UI, sans-serif", style="filled,rounded", '
+        'fontsize=11, margin="0.18,0.1", penwidth=1.4];\n'
+        '  edge [color="#7c8db588", arrowsize=0.7, penwidth=1.3, fontname="Segoe UI, sans-serif"];\n'
+        '  bgcolor = "transparent";\n'
+        "  concentrate = true;\n"  # merges edges that share a destination -- fewer overlapping lines
+        "  nodesep = 0.35;\n"
+        "  ranksep = 0.6;",
+    )
+
+    def _style_cluster(m):
+        return m.group(1) + (
+            '\n    style="rounded,filled"; bgcolor="#ffffff0c"; color="#ffffff33"; '
+            'fontcolor="#c7d2fe"; fontsize=12; fontname="Segoe UI, sans-serif";'
+        )
+
+    dot_source = _GRAPH_CLUSTER_OPEN_RE.sub(_style_cluster, dot_source)
+
+    node_ids = _GRAPH_NODE_LINE_RE.findall(dot_source)
+    style_lines = []
+    for node_id in node_ids:
+        style = _GRAPH_CATEGORY_STYLES[_classify_graph_node(node_id)]
+        escaped_id = node_id.replace('"', '\\"')
+        style_lines.append(
+            f'  "{escaped_id}" [fillcolor="{style["fillcolor"]}", color="{style["color"]}", fontcolor="{style["fontcolor"]}"];'
+        )
+
+    dot_source = dot_source.rstrip()
+    if dot_source.endswith("}") and style_lines:
+        dot_source = dot_source[:-1] + "\n" + "\n".join(style_lines) + "\n}\n"
+    return dot_source
+
+
+def get_dependency_graph_svg(project_id: str, group_by_module: bool = False) -> str:
+    """Renders this project's terraform dependency graph (`terraform graph`
+    piped through Graphviz's `dot`) as a styled, colour-coded SVG --
+    read-only, no Azure calls. Requires init to have succeeded (terraform
+    graph reads provider schema, which only exists post-init).
+
+    group_by_module collapses each module's resources into a single node
+    (see _build_module_level_graph_dot) -- the per-resource view is exact
+    but can be a real hairball on a deployment with a few dozen resources;
+    the module-level view trades that detail for something actually
+    readable at a glance."""
+    project = get_project(project_id)
+    if project is None:
+        raise ValueError("unknown project_id")
+    if not _is_initialized(project):
+        raise ValueError("project has not been initialized yet -- call init_project first")
+    cwd = os.path.join(project["project_root"], project["deployment"])
+
+    terraform_exe = _resolve_executable("terraform")
+    graph_proc = subprocess.run([terraform_exe, "graph"], cwd=cwd, capture_output=True, text=True, timeout=30)
+    if graph_proc.returncode != 0:
+        raise ValueError(f"terraform graph failed: {(graph_proc.stderr or graph_proc.stdout).strip()}")
+
+    dot_source = (
+        _build_module_level_graph_dot(graph_proc.stdout) if group_by_module else _style_dependency_graph_dot(graph_proc.stdout)
+    )
+
+    try:
+        dot_exe = _resolve_executable("dot")
+    except RuntimeError:
+        raise ValueError("Graphviz's 'dot' command isn't on PATH -- install Graphviz to use the dependency graph")
+    svg_proc = subprocess.run([dot_exe, "-Tsvg"], input=dot_source, capture_output=True, text=True, timeout=30)
+    if svg_proc.returncode != 0:
+        raise ValueError(f"dot failed to render the graph: {(svg_proc.stderr or '').strip()}")
+    return svg_proc.stdout
 
 
 # ===================================================================================
@@ -1503,7 +1726,22 @@ def _check_plan_not_stale(run: "Run"):
 # NATIVE FOLDER PICKER
 # ===================================================================================
 
-_FOLDER_PICKER_SCRIPT = """
+def _folder_picker_script(initial_dir: str | None) -> str:
+    """Builds the folder-picker PowerShell script, optionally pre-selecting
+    initial_dir (e.g. an org's last-browsed path) so the dialog opens
+    already pointed there instead of wherever Windows defaults to. Only
+    trusts initial_dir enough to check it's a real directory first --
+    FolderBrowserDialog.SelectedPath silently falls back to its default if
+    given a bogus path, so this doesn't even need to fail loudly on one."""
+    initial_path_line = ""
+    if initial_dir and os.path.isdir(initial_dir):
+        # PowerShell single-quoted strings only need '' -> ' escaping (no
+        # other metacharacters are special inside them), so this is safe
+        # even though initial_dir is user-influenced (an org's remembered
+        # browse path).
+        escaped = initial_dir.replace("'", "''")
+        initial_path_line = f"$dialog.SelectedPath = '{escaped}'"
+    return f"""
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
@@ -1522,17 +1760,18 @@ $owner.Activate()
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
 $dialog.Description = "Select the IaC project folder (contains modules/ and tf-deployment*)"
 $dialog.ShowNewFolderButton = $false
+{initial_path_line}
 
 $result = $dialog.ShowDialog($owner)
 $owner.Close()
 
-if ($result -eq [System.Windows.Forms.DialogResult]::OK) {
+if ($result -eq [System.Windows.Forms.DialogResult]::OK) {{
     Write-Output $dialog.SelectedPath
-}
+}}
 """
 
 
-def open_folder_dialog() -> str | None:
+def open_folder_dialog(initial_dir: str | None = None) -> str | None:
     """Pop a native Windows folder-browser dialog on this machine (the
     server and the browser are on the same box for this tool) and return
     the chosen path, or None if the user cancelled. Blocks the calling
@@ -1550,7 +1789,7 @@ def open_folder_dialog() -> str | None:
         )
     powershell_exe = _resolve_executable("powershell")
     result = subprocess.run(
-        [powershell_exe, "-NoProfile", "-NonInteractive", "-Sta", "-Command", _FOLDER_PICKER_SCRIPT],
+        [powershell_exe, "-NoProfile", "-NonInteractive", "-Sta", "-Command", _folder_picker_script(initial_dir)],
         capture_output=True,
         text=True,
         timeout=300,

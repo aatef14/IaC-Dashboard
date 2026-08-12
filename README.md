@@ -51,22 +51,34 @@ Requirements:
   other than your own desktop)? See **Running with Docker** below instead --
   those two features just fail with a clear message there rather than
   working, everything else is identical.
-- **Python 3.10+** on PATH.
-- **Terraform** on PATH.
-- **Azure CLI** (`az`) on PATH, logged in (`az login`) to the account that
-  should manage your infrastructure.
-- **VS Code's `code` CLI** on PATH, only if you want to use the **Open in
-  VS Code** button (VS Code's Command Palette ->
-  "Shell Command: Install 'code' command in PATH" if it isn't already there).
+- **Python 3.10+** on PATH -- the one thing `install.ps1` below can't
+  install for you (it needs Python to already exist to install everything
+  else). Get it from [python.org](https://python.org) (check "Add
+  python.exe to PATH" during install) if you don't have it.
 
 Setup:
 
 ```powershell
 git clone https://github.com/aatef14/IaC-Dashboard.git
 cd IaC-Dashboard
-pip install -r requirements.txt
+.\install.ps1
+az login
 .\start.ps1
 ```
+
+`install.ps1` checks for every external tool this dashboard shells out to --
+**Terraform**, **Azure CLI**, **Git** (Git Bash, used by the in-app
+terminal), **Graphviz** (used by the dependency graph view) -- and installs
+whichever are missing via `winget`, then runs `pip install -r
+requirements.txt` for the Python side. Safe to re-run any time; every check
+is a no-op if the tool's already there, and it never touches your saved
+projects/orgs/run history. Prints a summary at the end so you can see at a
+glance what's covered and what (if anything) needs installing by hand --
+**VS Code's `code` CLI** is the one thing it only checks, never installs,
+since it's entirely optional (only needed for the **Open in VS Code**
+button; the in-app editor works without it) -- VS Code's own Command
+Palette -> "Shell Command: Install 'code' command in PATH" adds it if you
+want it.
 
 Then open http://127.0.0.1:8765/. First run creates `organizations.json`,
 `projects.json`, `runs.db`, and `project-data/` next to the code -- all
@@ -277,6 +289,7 @@ ever be a human clicking a button, never an agent deciding to do it.
 | `projects.json` | Saved Work Projects (org_id, name, folder, deployment, environment, cloud_provider) |
 | `project-data/<project_id>/runs/<run_id>/` | Everything one plan run produced (`plan.tfplan`, `diff.json`) -- lives here, NOT inside the actual Terraform repo, so the dashboard never writes anything into your IaC project folder |
 | `static/` | Dashboard HTML/CSS/JS |
+| `install.ps1` | One-shot setup: checks/installs Terraform, Azure CLI, Git, Graphviz via `winget`, then `pip install`s the Python side |
 | `start.ps1` / `stop.ps1` | Background process management (PID tracked in `.server.pid`) |
 | `Dockerfile` / `docker-compose.yml` / `.dockerignore` | Container image (Python + Terraform + Azure CLI) -- see **Running with Docker** above |
 

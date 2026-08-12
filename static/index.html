@@ -84,6 +84,7 @@
       <button id="btn-view-tfvars" class="btn full-width" data-tip="View this project's tfvars file parsed into a readable tree, instead of raw HCL text.">View Config (tfvars)</button>
       <button id="btn-view-state" class="btn full-width" data-tip="Browse what's actually deployed per the last-refreshed Terraform state -- no plan or Azure portal required.">View Deployed State</button>
       <button id="btn-view-sources" class="btn full-width" data-tip="Modules and providers this deployment's own .tf files declare, with their pinned/constrained versions.">Modules &amp; Providers</button>
+      <button id="btn-view-graph" class="btn full-width" data-tip="Visual dependency graph (terraform graph via Graphviz), colour-coded by resource category. Opens in a new tab.">Dependency Graph</button>
       <label class="field-label">Plan name</label>
       <input id="plan-name-input" placeholder="e.g. before refactor" />
       <div class="btn-row">
@@ -200,6 +201,23 @@
       </div>
       <div id="xterm-container"></div>
     </div>
+  </main>
+
+  <!-- ===================== DEPENDENCY GRAPH ===================== -->
+  <main id="graph-view" class="hidden">
+    <div id="graph-title-bar">
+      <div>
+        <h2 id="graph-project-name"></h2>
+        <p class="muted">terraform graph, rendered via Graphviz -- colour-coded by resource category.</p>
+      </div>
+      <label class="graph-group-toggle" data-tip="Collapse each module's resources into one node -- the per-resource view can get dense on a real deployment.">
+        <input type="checkbox" id="chk-graph-group-modules" />
+        Group by module
+      </label>
+    </div>
+    <p id="graph-error" class="warn-text hidden"></p>
+    <div id="graph-legend" class="graph-legend"></div>
+    <div id="graph-container" class="graph-container"><p class="muted">Loading…</p></div>
   </main>
 
   <!-- ===================== MODALS ===================== -->

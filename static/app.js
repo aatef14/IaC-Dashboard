@@ -4,6 +4,7 @@ const orgViewEl = document.getElementById("org-view");
 const workspaceViewEl = document.getElementById("workspace-view");
 const toolsViewEl = document.getElementById("tools-view");
 const editorViewEl = document.getElementById("editor-view");
+const graphViewEl = document.getElementById("graph-view");
 const btnBackEl = document.getElementById("btn-back");
 const workspaceProjectNameEl = document.getElementById("workspace-project-name");
 const workspacePillsEl = document.getElementById("workspace-pills");
@@ -253,7 +254,7 @@ document.addEventListener(
 // coalesces remove+add into no change at all and nothing animates.
 function revealView(el, { back = false } = {}) {
   const cls = back ? "view-enter-back" : "view-enter";
-  for (const view of [landingViewEl, orgViewEl, workspaceViewEl, toolsViewEl, editorViewEl]) {
+  for (const view of [landingViewEl, orgViewEl, workspaceViewEl, toolsViewEl, editorViewEl, graphViewEl]) {
     if (view !== el) view.classList.add("hidden");
     view.classList.remove("view-enter", "view-enter-back");
   }
@@ -485,6 +486,10 @@ btnBackEl.onclick = () => {
     closeFileEditor();
     return;
   }
+  if (!graphViewEl.classList.contains("hidden")) {
+    openWorkspace(currentProject); // read-only view -- no unsaved-state guard needed
+    return;
+  }
   if (!toolsViewEl.classList.contains("hidden")) {
     // Tools isn't nested under any org/project, so there's no single
     // "parent" view to compute from currentOrg/currentProject the way the
@@ -565,23 +570,41 @@ async function restoreFromLocation({ pushHistory }) {
     showToolsView({ pushHistory });
     return;
   }
+  // Resolves org+project by name -- shared by every route below that opens
+  // its own tab (editor, graph) at a /<prefix>/<org>/<project> URL, one
+  // level deeper than the plain /<org>/<project> workspace route.
+  async function resolveOrgAndProject(orgName, projectName) {
+    const orgs = await api("/api/organizations");
+    const org = orgs.find((o) => o.name === orgName);
+    if (!org) throw new Error(`no organization named "${orgName}"`);
+    const projects = await api(`/api/projects?org_id=${org.id}`);
+    const project = projects.find((p) => p.name === projectName);
+    if (!project) throw new Error(`no project named "${projectName}" in "${orgName}"`);
+    return { org, project };
+  }
+
   // The editor opens in its own tab (a fresh load of this same app, at a
-  // /editor/<org>/<project> URL) rather than swapping the view in place --
-  // resolve org+project from the URL the same way the plain
-  // /<org>/<project> workspace route does below, just one level deeper.
+  // /editor/<org>/<project> URL) rather than swapping the view in place.
   const editorMatch = location.pathname.match(/^\/editor\/([^/]+)\/([^/]+)\/?$/);
   if (editorMatch) {
-    const orgName = decodeURIComponent(editorMatch[1]);
-    const projectName = decodeURIComponent(editorMatch[2]);
     try {
-      const orgs = await api("/api/organizations");
-      const org = orgs.find((o) => o.name === orgName);
-      if (!org) throw new Error(`no organization named "${orgName}"`);
-      const projects = await api(`/api/projects?org_id=${org.id}`);
-      const project = projects.find((p) => p.name === projectName);
-      if (!project) throw new Error(`no project named "${projectName}" in "${orgName}"`);
+      const { org, project } = await resolveOrgAndProject(decodeURIComponent(editorMatch[1]), decodeURIComponent(editorMatch[2]));
       currentOrg = org;
       await showFileEditor(project, { pushHistory });
+    } catch (e) {
+      toast(`That link is no longer valid: ${e.message}`, { type: "error" });
+      showLanding({ pushHistory });
+    }
+    return;
+  }
+
+  // Same idea for the dependency graph -- /graph/<org>/<project>, its own tab.
+  const graphMatch = location.pathname.match(/^\/graph\/([^/]+)\/([^/]+)\/?$/);
+  if (graphMatch) {
+    try {
+      const { org, project } = await resolveOrgAndProject(decodeURIComponent(graphMatch[1]), decodeURIComponent(graphMatch[2]));
+      currentOrg = org;
+      await showDependencyGraph(project, { pushHistory });
     } catch (e) {
       toast(`That link is no longer valid: ${e.message}`, { type: "error" });
       showLanding({ pushHistory });
@@ -1177,7 +1200,10 @@ btnAddProjectEl.onclick = () => {
   projectNameInputEl.value = "";
   projectNameInputEl.disabled = false;
   projectNameInputEl.title = "";
-  projectRootInputEl.value = "";
+  // Pre-fills from this org's last-browsed path (see btnBrowseEl.onclick)
+  // instead of always starting blank -- most useful when an org's
+  // projects live under one shared parent repo/client folder.
+  projectRootInputEl.value = (currentOrg && currentOrg.last_browsed_path) || "";
   retentionDaysInputEl.value = "";
   tabExistingFolderEl.classList.remove("hidden");
   tabNewFolderEl.classList.remove("hidden");
@@ -1231,7 +1257,11 @@ function showAddProjectError(message) {
 
 btnBrowseEl.onclick = async () => {
   try {
-    const { path } = await api("/api/browse-folder", { method: "POST" });
+    const { path } = await api("/api/browse-folder", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ org_id: currentOrg ? currentOrg.id : null }),
+    });
     if (path) projectRootInputEl.value = path;
   } catch (e) {
     showAddProjectError(e.message);
@@ -2610,6 +2640,90 @@ btnViewSourcesEl.onclick = async () => {
   }
 };
 
+// ---------- dependency graph (its own tab, same pattern as the editor) ----------
+
+const btnViewGraphEl = document.getElementById("btn-view-graph");
+const graphProjectNameEl = document.getElementById("graph-project-name");
+const graphErrorEl = document.getElementById("graph-error");
+const graphLegendEl = document.getElementById("graph-legend");
+const graphContainerEl = document.getElementById("graph-container");
+const chkGraphGroupModulesEl = document.getElementById("chk-graph-group-modules");
+
+// Mirrors run_manager.py's _GRAPH_CATEGORY_STYLES -- just the "color" value
+// from each category, purely for the legend key. The actual SVG arrives
+// already colored from the server; this only has to LABEL what each color
+// means, not reproduce the styling logic itself.
+const GRAPH_LEGEND = [
+  ["Data source", "#64748b"],
+  ["Identity / role assignment", "#10b981"],
+  ["Network", "#a78bfa"],
+  ["Storage / data store", "#60a5fa"],
+  ["Compute / AI", "#fbbf24"],
+  ["Utility (time_static, etc.)", "#f472b6"],
+  ["Other resource", "#94a3b8"],
+];
+
+async function showDependencyGraph(project, { pushHistory = true } = {}) {
+  // Each of the editor/graph/workspace views opens in its own tab, so
+  // there's no cross-tab conflict in reusing the same global the workspace
+  // itself uses -- and the Back button's openWorkspace(currentProject)
+  // call needs this set, the same way openWorkspace sets it for itself.
+  currentProject = project;
+  revealView(graphViewEl);
+  hideBgParticles();
+  renderBreadcrumb([
+    { label: "IaC-Dashboard", onClick: showLanding },
+    { label: currentOrg.name, onClick: () => showOrgView(currentOrg) },
+    { label: project.name, onClick: () => openWorkspace(project) },
+    { label: "Dependency Graph" },
+  ]);
+  btnBackEl.classList.remove("hidden");
+  btnBackEl.textContent = "←";
+  graphProjectNameEl.textContent = project.name;
+  graphLegendEl.innerHTML = GRAPH_LEGEND.map(
+    ([label, color]) =>
+      `<span class="graph-legend-chip"><span class="graph-legend-dot" style="background:${color}"></span>${escapeHtml(label)}</span>`
+  ).join("");
+  document.title = `Graph — ${project.name} — IaC-Dashboard`;
+  chkGraphGroupModulesEl.checked = false;
+
+  if (pushHistory) {
+    const url = `/graph/${encodeURIComponent(currentOrg.name)}/${encodeURIComponent(project.name)}`;
+    if (location.pathname !== url) history.pushState({}, "", url);
+  }
+
+  await loadGraphSvg();
+}
+
+// Not api() -- that assumes a JSON body, but this endpoint returns raw SVG
+// (image/svg+xml) straight through so the browser never has to round-trip
+// it through JSON string-escaping. Re-fetches whenever the "Group by
+// module" toggle changes, not just on the initial view load.
+async function loadGraphSvg() {
+  graphErrorEl.classList.add("hidden");
+  graphContainerEl.innerHTML = `<p class="muted">Loading…</p>`;
+  const query = chkGraphGroupModulesEl.checked ? "?group=modules" : "";
+  try {
+    const res = await fetch(`/api/projects/${currentProject.id}/dependency-graph${query}`);
+    const text = await res.text();
+    if (!res.ok) {
+      const body = JSON.parse(text);
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    graphContainerEl.innerHTML = text;
+  } catch (e) {
+    graphErrorEl.textContent = e.message;
+    graphErrorEl.classList.remove("hidden");
+    graphContainerEl.innerHTML = "";
+  }
+}
+chkGraphGroupModulesEl.onchange = loadGraphSvg;
+
+btnViewGraphEl.onclick = () => {
+  const url = `/graph/${encodeURIComponent(currentOrg.name)}/${encodeURIComponent(currentProject.name)}`;
+  window.open(url, "_blank");
+};
+
 // ---------- restart server ----------
 // Called from the header dropdown menu (see "header menu" below).
 
@@ -3267,10 +3381,26 @@ async function openTerminal() {
     });
   }
 
+  // Removing "hidden" a few lines up doesn't take effect in the layout
+  // until the browser actually reflows -- fitting (or connecting the
+  // socket, which lets PTY output start arriving) immediately after
+  // `open()` was measuring a container that was still effectively 0x0.
+  // xterm's DOM renderer painted those very first rows against that bogus
+  // size and never repainted them once a later fit() corrected the
+  // dimensions -- the buffer had the right text (confirmed via
+  // buffer.active.getLine()) but the rows stayed visually blank.
+  // Reading offsetHeight forces a synchronous layout flush right now --
+  // deliberately NOT `await new Promise(requestAnimationFrame)`, which
+  // depends on the tab actively compositing frames and can stall
+  // indefinitely in a backgrounded/throttled tab.
+  void xtermContainerEl.offsetHeight;
+  xtermFitAddon.fit();
+
   if (!terminalSocket || terminalSocket.readyState === WebSocket.CLOSED) {
-    terminalSocket = connectTerminalSocket();
+    terminalSocket = connectTerminalSocket(); // its onopen handler re-fits/resizes again, cheap insurance
+  } else {
+    sendTerminalResize();
   }
-  setTimeout(sendTerminalResize, 50); // after the panel's own show transition/layout settles
 }
 
 function hideTerminalPanel() {

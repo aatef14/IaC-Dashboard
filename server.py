@@ -604,11 +604,24 @@ async def api_check_name_availability(request: Request):
 @server.custom_route("/api/browse-folder", methods=["POST"])
 async def api_browse_folder(request: Request):
     """Pops a native Windows folder picker on this machine and returns the
-    chosen path. Blocks (in a worker thread) until the user picks or cancels."""
+    chosen path. Blocks (in a worker thread) until the user picks or
+    cancels. An optional org_id in the body both seeds the dialog's
+    starting folder (from that org's last-browsed path, if any) and gets
+    updated with whatever the user picks this time -- a pure convenience
+    hint, org_id is optional and this still works with none at all."""
+    body, _ = await _json_body(request)
+    org_id = (body or {}).get("org_id")
+    initial_dir = None
+    if org_id:
+        org = rm.get_org(org_id)
+        if org:
+            initial_dir = org.get("last_browsed_path")
     try:
-        path = await asyncio.to_thread(rm.open_folder_dialog)
+        path = await asyncio.to_thread(rm.open_folder_dialog, initial_dir)
     except RuntimeError as e:
         return JSONResponse({"error": str(e)}, status_code=500)
+    if path and org_id:
+        await asyncio.to_thread(rm.set_org_last_browsed_path, org_id, path)
     return JSONResponse({"path": path})
 
 
@@ -789,6 +802,21 @@ async def api_module_and_provider_sources(request: Request):
     declare, parsed straight from source -- not the lock file."""
     try:
         return JSONResponse(await asyncio.to_thread(rm.get_module_and_provider_sources, request.path_params["project_id"]))
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
+@server.custom_route("/api/projects/{project_id}/dependency-graph", methods=["GET"])
+async def api_dependency_graph(request: Request):
+    """Styled SVG of this project's terraform dependency graph
+    (terraform graph | dot -Tsvg, colour-coded by resource category).
+    ?group=modules collapses each module to a single node -- the
+    per-resource view on a real deployment is a hairball, this is the
+    "what depends on what" view instead."""
+    group_by_module = request.query_params.get("group") == "modules"
+    try:
+        svg = await asyncio.to_thread(rm.get_dependency_graph_svg, request.path_params["project_id"], group_by_module)
+        return Response(svg, media_type="image/svg+xml")
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 
@@ -1036,6 +1064,13 @@ async def project_deep_link(request: Request):
 async def editor_deep_link(request: Request):
     """SPA fallback for the in-app file editor's own tab -- see the
     /editor/<org>/<project> route in app.js's restoreFromLocation()."""
+    return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
+
+
+@server.custom_route("/graph/{org_name}/{project_name}", methods=["GET"])
+async def graph_deep_link(request: Request):
+    """SPA fallback for the dependency graph's own tab -- see the
+    /graph/<org>/<project> route in app.js's restoreFromLocation()."""
     return FileResponse(os.path.join(STATIC_DIR, "index.html"), headers=_NO_STORE_HEADERS)
 
 
