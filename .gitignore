@@ -19,6 +19,11 @@ runs.db-shm
 # resource attribute values, i.e. a map of the real deployed infrastructure)
 project-data/
 
+# Local clones of Cloud organizations' repos -- this machine's working
+# copy only, not the actual shared repo (see run_manager.py's CLOUD
+# ORGANIZATIONS section)
+cloud-orgs/
+
 # Server logs and the background-process pid file
 server.log
 server.log.err

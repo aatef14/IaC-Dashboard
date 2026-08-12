@@ -108,12 +108,20 @@ async def list_organizations() -> list:
 
 
 @server.tool()
-async def add_organization(name: str) -> dict:
+async def add_organization(name: str, mode: str = "local", repo_url: str | None = None) -> dict:
     """Create a new Organization. Projects are addressed as
     /<org-name>/<project-name>, so every project must belong to one --
-    call this first if list_organizations came back empty."""
+    call this first if list_organizations came back empty.
+
+    mode="cloud" (with repo_url set) makes this a Cloud organization: its
+    projects' actual Terraform files, plus a manifest of which projects it
+    has, live in that Git repo instead of only this machine -- someone
+    else who creates an org with the SAME name and SAME repo_url ends up
+    seeing the same projects. Relies entirely on git credentials already
+    configured on this machine; repo_url must already be one you can
+    clone/push to."""
     try:
-        return await asyncio.to_thread(rm.add_org, name)
+        return await asyncio.to_thread(rm.add_org, name, mode, repo_url)
     except ValueError as e:
         return {"error": str(e)}
 
@@ -1050,7 +1058,10 @@ async def api_add_org(request: Request):
     if "name" not in body:
         return JSONResponse({"error": "missing 'name'"}, status_code=400)
     try:
-        org = rm.add_org(body["name"])
+        # add_org clones the repo for mode="cloud" -- a real network call,
+        # so it runs off the event loop like any other git/terraform
+        # subprocess call in this file.
+        org = await asyncio.to_thread(rm.add_org, body["name"], body.get("mode", "local"), body.get("repo_url"))
         return JSONResponse(org)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
@@ -1060,6 +1071,18 @@ async def api_add_org(request: Request):
 async def api_delete_org(request: Request):
     rm.remove_org(request.path_params["org_id"])
     return JSONResponse({"ok": True})
+
+
+@server.custom_route("/api/organizations/{org_id}/sync", methods=["POST"])
+async def api_sync_org(request: Request):
+    """Pull the latest from a Cloud org's repo and pick up any new projects
+    someone else pushed. A no-op (returns {"pulled": false, "warning": null})
+    for a Local org."""
+    try:
+        result = await asyncio.to_thread(rm.sync_cloud_org, request.path_params["org_id"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
 
 
 @server.custom_route("/api/projects", methods=["GET"])

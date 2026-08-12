@@ -371,6 +371,21 @@
       <h2>New Organization</h2>
       <label class="field-label">Name</label>
       <input id="org-name-input" placeholder="e.g. Acme-Corp (no spaces)" />
+
+      <div id="org-mode-tabs" class="tabs">
+        <button type="button" id="tab-org-local" class="tab active" data-mode="local">Local</button>
+        <button type="button" id="tab-org-cloud" class="tab" data-mode="cloud">Cloud</button>
+      </div>
+      <p id="org-mode-hint" class="muted">Local: everything stays on this machine only (the default, unchanged).</p>
+      <div id="org-repo-url-box" class="hidden">
+        <label class="field-label">Git repo URL</label>
+        <input id="org-repo-url-input" placeholder="git@github.com:you/repo.git" />
+        <p class="muted">This org's projects (actual Terraform files + which projects exist) will be cloned from, and
+          pushed to, this repo -- so anyone who creates an org with the same name and this same repo URL sees the
+          same projects. Uses whatever git credentials already work on this machine; make sure it's a
+          <b>private</b> repo, since real project data gets committed into it.</p>
+      </div>
+      <div id="add-org-warning" class="warn-text hidden"></div>
       <div id="add-org-error" class="warn-text hidden"></div>
       <div class="modal-actions">
         <button class="btn modal-close">Cancel</button>

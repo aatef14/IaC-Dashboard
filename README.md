@@ -279,6 +279,48 @@ Project **name is permanent** once created (unique within its organization)
 are built on, so renaming isn't offered (delete and re-add if you genuinely
 need a different name).
 
+## Cloud organizations
+
+By default (**Local**), an Organization's projects live only on this
+machine -- if you share your LAN IP, everyone's looking at your one shared
+instance. **Cloud** mode is the alternative: each person runs their own
+separate dashboard instance, but a Cloud org's projects -- the actual
+Terraform files AND which projects exist -- live in a Git repo you provide,
+so everyone stays in sync through that repo instead of one shared server.
+
+- When creating an Organization, pick **Cloud** and give it a Git repo URL.
+  The dashboard clones it into `cloud-orgs/<org-id>/repo` (git-ignored,
+  machine-local) and reads a manifest already there (if any) to populate
+  this org's project list.
+- **Add Work Project** for a Cloud org works exactly like a Local one, just
+  rooted inside that clone -- Browse opens there by default. Creating,
+  editing, or deleting a project commits and pushes the change (the actual
+  project files, plus a small manifest at `.iac-dashboard/projects.json`
+  listing every project) automatically.
+- **To join an existing Cloud org from another machine**: create an
+  Organization with the **same name** and the **same repo URL**. There's no
+  shared id across machines -- that name+URL match is the only thing
+  linking them. Opening the org pulls the latest and picks up any projects
+  someone else added; this also happens automatically every time you open
+  it, not just once at creation.
+- Uses whatever git credentials already work on this machine (SSH key,
+  Windows Credential Manager, a cached HTTPS token) -- the dashboard never
+  handles credentials itself. A private repo you don't have access to
+  fails with git's own auth error; if it's someone else's repo, they need
+  to add you as a collaborator on GitHub first.
+- **Use a private repo.** Real project data -- tfvars values, resource
+  names, file paths -- gets committed into whatever repo you provide. The
+  dashboard does a best-effort check against a public github.com repo and
+  warns you at creation time, but that check is heuristic (only understands
+  github.com URLs, skips silently on a network hiccup) -- don't rely on it
+  as the only safeguard.
+- Sync is add-only: if someone deletes a project, it disappears from *their*
+  view, but other machines that already synced it keep their local copy
+  (deleting it yourself removes it everywhere, same as adding one).
+- Run history, Azure auth, and the `initialized` (`.terraform/` present)
+  state stay local per machine either way -- never shared, same as a Local
+  org.
+
 ## Apply safety
 
 Apply is never one click on either side, whether it's a normal plan or a
@@ -368,6 +410,7 @@ ever be a human clicking a button, never an agent deciding to do it.
 | `organizations.json` | Saved Organizations (name) -- every project belongs to one |
 | `projects.json` | Saved Work Projects (org_id, name, folder, deployment, environment, cloud_provider) |
 | `project-data/<project_id>/runs/<run_id>/` | Everything one plan run produced (`plan.tfplan`, `diff.json`) -- lives here, NOT inside the actual Terraform repo, so the dashboard never writes anything into your IaC project folder |
+| `cloud-orgs/<org_id>/repo/` | A Cloud org's cloned repo -- this machine's working copy only, see **Cloud organizations** above. `.iac-dashboard/projects.json` inside it (committed to the repo itself, not listed here since it's not local-only) is the manifest of that org's projects |
 | `static/` | Dashboard HTML/CSS/JS |
 | `install.ps1` | One-shot setup: checks/installs Terraform, Azure CLI, Git, Graphviz via `winget`, `pip install`s the Python side, then runs `start.ps1` |
 | `start.ps1` / `stop.ps1` | Background process management (PID tracked in `.server.pid`) |

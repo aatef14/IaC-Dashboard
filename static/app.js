@@ -27,7 +27,13 @@ const addProjectModalEl = document.getElementById("add-project-modal");
 const addOrgModalEl = document.getElementById("add-org-modal");
 const orgNameInputEl = document.getElementById("org-name-input");
 const addOrgErrorEl = document.getElementById("add-org-error");
+const addOrgWarningEl = document.getElementById("add-org-warning");
 const btnCreateOrgEl = document.getElementById("btn-create-org");
+const tabOrgLocalEl = document.getElementById("tab-org-local");
+const tabOrgCloudEl = document.getElementById("tab-org-cloud");
+const orgModeHintEl = document.getElementById("org-mode-hint");
+const orgRepoUrlBoxEl = document.getElementById("org-repo-url-box");
+const orgRepoUrlInputEl = document.getElementById("org-repo-url-input");
 
 const projectNameInputEl = document.getElementById("project-name-input");
 const tabExistingFolderEl = document.getElementById("tab-existing-folder");
@@ -565,6 +571,21 @@ async function showOrgView(org, { pushHistory = true } = {}) {
     const url = `/${encodeURIComponent(org.name)}`;
     if (location.pathname !== url) history.pushState({ orgId: org.id }, "", url);
   }
+
+  // Cloud org: pull the latest from its repo before showing projects, so
+  // anything a collaborator pushed shows up without a manual refresh.
+  // No-op server-side for a Local org. Best-effort -- a pull failure (no
+  // network, no credentials) is surfaced as a toast, not a blocking error,
+  // since whatever synced previously is still viewable.
+  if (org.mode === "cloud") {
+    try {
+      const result = await api(`/api/organizations/${org.id}/sync`, { method: "POST" });
+      if (result.warning) toast(`Cloud sync: ${result.warning}`, { type: "warning", duration: 7000 });
+    } catch (e) {
+      toast(`Cloud sync failed: ${e.message}`, { type: "warning", duration: 7000 });
+    }
+  }
+
   await refreshProjects();
 }
 
@@ -932,7 +953,7 @@ function renderOrgCard(o) {
   card.className = "project-card";
   card.innerHTML = `
     <div class="card-top-row">
-      <div class="name">${o.name}</div>
+      <div class="name">${o.name}${o.mode === "cloud" ? '<span class="badge cloud-badge" title="Projects live in a shared Git repo">☁ Cloud</span>' : ""}</div>
       <button class="card-menu-btn" data-tip="Organization settings" aria-label="Organization settings">&#8942;</button>
     </div>
     <div class="path">${o.project_count} work project${o.project_count === 1 ? "" : "s"}</div>
@@ -1166,31 +1187,69 @@ projectSearchInputEl.addEventListener("input", renderFilteredProjects);
 
 // ---------- add organization modal ----------
 
+let addOrgMode = "local";
+
+function setOrgMode(mode) {
+  addOrgMode = mode;
+  tabOrgLocalEl.classList.toggle("active", mode === "local");
+  tabOrgCloudEl.classList.toggle("active", mode === "cloud");
+  orgRepoUrlBoxEl.classList.toggle("hidden", mode !== "cloud");
+  orgModeHintEl.textContent =
+    mode === "cloud"
+      ? "Cloud: this org's projects live in a Git repo -- anyone who creates an org with the same name + repo URL sees the same projects."
+      : "Local: everything stays on this machine only (the default, unchanged).";
+}
+tabOrgLocalEl.onclick = () => setOrgMode("local");
+tabOrgCloudEl.onclick = () => setOrgMode("cloud");
+
 btnAddOrgEl.onclick = () => {
   orgNameInputEl.value = "";
+  orgRepoUrlInputEl.value = "";
   addOrgErrorEl.classList.add("hidden");
+  addOrgWarningEl.classList.add("hidden");
+  setOrgMode("local");
   openModal(addOrgModalEl);
 };
 
 btnCreateOrgEl.onclick = async () => {
   addOrgErrorEl.classList.add("hidden");
+  addOrgWarningEl.classList.add("hidden");
   const name = orgNameInputEl.value.trim();
   if (!name) {
     addOrgErrorEl.textContent = "Give this organization a name.";
     addOrgErrorEl.classList.remove("hidden");
     return;
   }
+  const repoUrl = orgRepoUrlInputEl.value.trim();
+  if (addOrgMode === "cloud" && !repoUrl) {
+    addOrgErrorEl.textContent = "Enter a Git repo URL for a Cloud organization.";
+    addOrgErrorEl.classList.remove("hidden");
+    return;
+  }
+  const originalLabel = btnCreateOrgEl.textContent;
+  if (addOrgMode === "cloud") btnCreateOrgEl.textContent = "Cloning repo…";
+  btnCreateOrgEl.disabled = true;
   try {
     const org = await api("/api/organizations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ name }),
+      body: JSON.stringify({ name, mode: addOrgMode, repo_url: addOrgMode === "cloud" ? repoUrl : undefined }),
     });
+    if (org.warning) {
+      // Non-fatal (e.g. the repo looks public) -- org was still created,
+      // just flag it instead of silently proceeding.
+      addOrgWarningEl.textContent = org.warning;
+      addOrgWarningEl.classList.remove("hidden");
+      toast(org.warning, { type: "warning", duration: 9000 });
+    }
     closeModals();
     await showOrgView(org);
   } catch (e) {
     addOrgErrorEl.textContent = e.message;
     addOrgErrorEl.classList.remove("hidden");
+  } finally {
+    btnCreateOrgEl.disabled = false;
+    btnCreateOrgEl.textContent = originalLabel;
   }
 };
 

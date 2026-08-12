@@ -31,6 +31,7 @@ import secrets
 import shutil
 import subprocess
 import tempfile
+import urllib.request
 
 import run_store
 import threading
@@ -116,17 +117,49 @@ def _validate_name(name: str, what: str) -> str:
     return name
 
 
-def add_org(name: str) -> dict:
+def add_org(name: str, mode: str = "local", repo_url: str | None = None) -> dict:
+    """mode="cloud" clones repo_url and syncs this org's projects from the
+    manifest committed there (see the CLOUD ORGANIZATIONS section below) --
+    everything else about a Cloud org is identical to a Local one from
+    here on. mode="local" (the default) is completely unchanged from
+    before this existed."""
     name = _validate_name(name, "organization")
+    mode = "cloud" if mode == "cloud" else "local"
 
-    org = {"id": str(uuid.uuid4()), "name": name, "created_at": time.time()}
+    org_id = str(uuid.uuid4())
+    org = {"id": org_id, "name": name, "created_at": time.time(), "mode": mode}
+    warning = None
+
+    if mode == "cloud":
+        repo_url = (repo_url or "").strip()
+        if not repo_url:
+            raise ValueError("a Git repo URL is required for a Cloud organization")
+        repo_dir = _cloud_repo_dir(org_id)
+        _clone_cloud_repo(repo_url, repo_dir)
+        org["repo_url"] = repo_url
+        org["local_repo_path"] = repo_dir
+        warning = _check_repo_public_warning(repo_url)
+
     with _orgs_lock:
         orgs = _load_orgs()
         if any(o["name"] == name for o in orgs):
+            if mode == "cloud":
+                # Otherwise the clone we just made is left orphaned under
+                # cloud-orgs/ with nothing in organizations.json pointing
+                # at it. Removes the org_id parent dir, not just repo/ --
+                # _cloud_repo_dir nests the clone one level deeper than the
+                # org_id folder itself, which would otherwise be left
+                # behind, empty.
+                shutil.rmtree(os.path.dirname(org["local_repo_path"]), ignore_errors=True)
             raise ValueError(f"an organization named '{name}' already exists -- pick a different name")
         orgs.append(org)
         _save_orgs(orgs)
-    return org
+
+    if mode == "cloud":
+        set_org_last_browsed_path(org_id, org["local_repo_path"])
+        _sync_projects_from_manifest(org)
+
+    return {**org, "warning": warning} if warning else org
 
 
 def list_orgs() -> list[dict]:
@@ -163,7 +196,10 @@ def set_org_last_browsed_path(org_id: str, path: str):
 def remove_org(org_id: str):
     """Delete an organization and cascade-delete every project inside it
     (each via remove_project, so run history/plan data is cleaned up the
-    same way a direct project delete would)."""
+    same way a direct project delete would). For a Cloud org this also
+    deletes the local clone of its repo -- that's just this machine's
+    working copy, not the actual remote repo, so nothing shared is lost."""
+    org = get_org(org_id)
     with _projects_lock:
         project_ids = [p["id"] for p in _load_projects() if p.get("org_id") == org_id]
     for pid in project_ids:
@@ -172,6 +208,181 @@ def remove_org(org_id: str):
     with _orgs_lock:
         orgs = [o for o in _load_orgs() if o["id"] != org_id]
         _save_orgs(orgs)
+
+    if org and org.get("mode") == "cloud" and org.get("local_repo_path"):
+        # Removes the org_id parent dir, not just repo/ -- see the matching
+        # comment in add_org's name-collision cleanup.
+        shutil.rmtree(os.path.dirname(org["local_repo_path"]), ignore_errors=True)
+
+
+# ===================================================================================
+# CLOUD ORGANIZATIONS -- for a Cloud org (mode="cloud"), the org's actual Terraform
+# project files AND a manifest of which projects it has both live in a Git repo you
+# provide, instead of only on this machine. A second person who creates an org with
+# the SAME name and the SAME repo_url ends up looking at the same projects, because
+# their dashboard clones that repo too and reads the same manifest -- there's no
+# shared id across machines, just "same name + same repo" as the join condition.
+# Local orgs (the default, and everything before this feature) are unaffected.
+#
+# Relies entirely on whatever git credentials already work on this machine (SSH key,
+# Windows Credential Manager, a cached HTTPS token) -- the dashboard never handles
+# credentials itself, so a private repo you don't have access to just fails with
+# git's own auth error.
+# ===================================================================================
+
+CLOUD_ORGS_DIR = os.path.join(DATA_DIR, "cloud-orgs")
+_MANIFEST_RELATIVE_PATH = os.path.join(".iac-dashboard", "projects.json")
+
+
+def _cloud_repo_dir(org_id: str) -> str:
+    return os.path.join(CLOUD_ORGS_DIR, org_id, "repo")
+
+
+def _run_git(args: list[str], cwd: str, timeout: int = 60) -> str:
+    git_exe = _resolve_executable("git")
+    result = subprocess.run([git_exe, *args], cwd=cwd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0:
+        raise ValueError(f"git {' '.join(args)} failed: {result.stderr.strip() or result.stdout.strip()}")
+    return result.stdout
+
+
+def _clone_cloud_repo(repo_url: str, repo_dir: str):
+    os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
+    git_exe = _resolve_executable("git")
+    result = subprocess.run([git_exe, "clone", repo_url, repo_dir], capture_output=True, text=True, timeout=120)
+    if result.returncode != 0:
+        raise ValueError(f"could not clone '{repo_url}': {result.stderr.strip() or result.stdout.strip()}")
+
+
+def _check_repo_public_warning(repo_url: str) -> str | None:
+    """Best-effort, non-fatal: a Cloud org commits real project data (tfvars
+    values, resource names, paths) into repo_url, so a public repo would
+    leak that. Only understands github.com URLs; anything else, or a
+    network hiccup, just skips the check silently rather than blocking org
+    creation over a heuristic that couldn't be evaluated."""
+    m = re.search(r"github\.com[:/]+([^/]+)/([^/.]+)", repo_url)
+    if not m:
+        return None
+    owner, repo = m.group(1), m.group(2)
+    try:
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{owner}/{repo}",
+            headers={"Accept": "application/vnd.github+json", "User-Agent": "IaC-Dashboard"},
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode())
+        if data.get("private") is False:
+            return (
+                f"'{owner}/{repo}' appears to be a PUBLIC repository. This Cloud organization will commit "
+                "real project data (tfvars values, resource names, file paths) into it -- consider making it "
+                "private."
+            )
+    except Exception:
+        return None
+    return None
+
+
+def _manifest_path(org: dict) -> str:
+    return os.path.join(org["local_repo_path"], _MANIFEST_RELATIVE_PATH)
+
+
+def _read_manifest(org: dict) -> list[dict]:
+    path = _manifest_path(org)
+    if not os.path.exists(path):
+        return []
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_manifest(org: dict, entries: list[dict]):
+    path = _manifest_path(org)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(entries, f, indent=2)
+
+
+def _manifest_entry_for(project: dict, org: dict) -> dict:
+    return {
+        "name": project["name"],
+        "subfolder": os.path.relpath(project["project_root"], org["local_repo_path"]),
+        "deployment": project["deployment"],
+        "environment": project["environment"],
+        "cloud_provider": project["cloud_provider"],
+    }
+
+
+def _upsert_manifest_entry(org: dict, project: dict):
+    entries = [e for e in _read_manifest(org) if e["name"] != project["name"]]
+    entries.append(_manifest_entry_for(project, org))
+    _write_manifest(org, entries)
+
+
+def _remove_manifest_entry(org: dict, project_name: str):
+    entries = [e for e in _read_manifest(org) if e["name"] != project_name]
+    _write_manifest(org, entries)
+
+
+def _git_commit_and_push(org: dict, message: str):
+    """Commits whatever changed under the cloned repo (the manifest, and
+    any project files a scaffold/init just wrote) and pushes. Needs
+    user.name/user.email already configured on this machine (globally, or
+    for this repo specifically) -- if not, git's own error surfaces as-is
+    rather than the dashboard silently guessing an identity to commit
+    under."""
+    repo_dir = org["local_repo_path"]
+    _run_git(["add", "-A"], cwd=repo_dir)
+    if not _run_git(["status", "--porcelain"], cwd=repo_dir).strip():
+        return  # nothing changed -- e.g. re-syncing an already-up-to-date manifest
+    _run_git(["commit", "-m", message], cwd=repo_dir)
+    _run_git(["push"], cwd=repo_dir, timeout=120)
+
+
+def _sync_projects_from_manifest(org: dict):
+    """Creates local Project records for any manifest entry not already
+    saved locally under this org -- how a second person (same org name,
+    same repo URL) ends up seeing projects someone else created. Add-only
+    by design: a manifest entry disappearing (someone deleted that project)
+    does NOT delete the local record here -- silently cascading a delete
+    (and its run history) from a background sync felt too destructive for
+    a first version; remove it yourself if it's genuinely gone."""
+    with _projects_lock:
+        existing_names = {p["name"] for p in _load_projects() if p.get("org_id") == org["id"]}
+    for entry in _read_manifest(org):
+        if entry["name"] in existing_names:
+            continue
+        project_root = os.path.join(org["local_repo_path"], entry["subfolder"])
+        try:
+            add_project(
+                org["id"],
+                entry["name"],
+                project_root,
+                entry["deployment"],
+                entry["environment"],
+                entry.get("cloud_provider", "azure"),
+                _from_manifest=True,
+            )
+        except ValueError:
+            continue  # e.g. folder not actually present in this clone yet -- skip, don't blow up the whole sync
+
+
+def sync_cloud_org(org_id: str) -> dict:
+    """Pulls the latest from the org's repo and picks up any new projects
+    someone else pushed -- called when opening a Cloud org's page. A pull
+    failure (no network, no credentials) is reported back rather than
+    raised, since it shouldn't block viewing whatever was already synced
+    locally."""
+    org = get_org(org_id)
+    if org is None:
+        raise ValueError("unknown org_id")
+    if org.get("mode") != "cloud":
+        return {"pulled": False, "warning": None}
+    try:
+        _run_git(["pull", "--ff-only"], cwd=org["local_repo_path"], timeout=120)
+        pulled, warning = True, None
+    except ValueError as e:
+        pulled, warning = False, str(e)
+    _sync_projects_from_manifest(org)
+    return {"pulled": pulled, "warning": warning}
 
 
 # ===================================================================================
@@ -342,6 +553,13 @@ def initialize_project_folder(project_root: str) -> dict:
     os.makedirs(os.path.join(project_root, "modules"), exist_ok=True)
     os.makedirs(os.path.join(deployment_dir, "backend"), exist_ok=True)
     os.makedirs(os.path.join(deployment_dir, "environmentVariables"), exist_ok=True)
+    # Git doesn't track empty directories -- an empty modules/ never gets
+    # committed/pushed for a Cloud org, so anyone syncing from the
+    # manifest later would clone a repo missing it entirely and fail
+    # discover_project's "modules/ must exist" check. Harmless placeholder
+    # for a Local org too.
+    with open(os.path.join(project_root, "modules", ".gitkeep"), "w", encoding="utf-8"):
+        pass
 
     with open(os.path.join(deployment_dir, "main.tf"), "w", encoding="utf-8") as f:
         f.write(tpl["main_tf"])
@@ -378,12 +596,14 @@ def add_project(
     environment: str,
     cloud_provider: str = "azure",
     retention_days: int | None = None,
+    _from_manifest: bool = False,
 ) -> dict:
     # Kept as a stored field so an AWS (or other) provider can be added later
     # without migrating existing records -- but only azure is accepted today.
     if cloud_provider != "azure":
         raise ValueError("only 'azure' is supported right now")
-    if get_org(org_id) is None:
+    org = get_org(org_id)
+    if org is None:
         raise ValueError("unknown org_id -- create an organization first")
 
     name = _validate_name(name, "project")
@@ -425,6 +645,13 @@ def add_project(
     # other place this gets set) -- either path should teach the org
     # where its projects tend to live.
     set_org_last_browsed_path(org_id, discovered["project_root"])
+
+    # _from_manifest means this call came FROM _sync_projects_from_manifest
+    # reading the repo's own manifest -- pushing right back would be
+    # redundant (and could race with someone else's concurrent push).
+    if org.get("mode") == "cloud" and not _from_manifest:
+        _upsert_manifest_entry(org, project)
+        _git_commit_and_push(org, f"Add project '{name}'")
 
     return project
 
@@ -483,6 +710,7 @@ def get_project_view(project_id: str) -> dict | None:
 def remove_project(project_id: str):
     with _projects_lock:
         projects = _load_projects()
+        project = next((p for p in projects if p["id"] == project_id), None)
         projects = [p for p in projects if p["id"] != project_id]
         _save_projects(projects)
 
@@ -495,6 +723,15 @@ def remove_project(project_id: str):
     project_dir = os.path.join(PROJECT_DATA_DIR, project_id)
     if os.path.isdir(project_dir):
         shutil.rmtree(project_dir, ignore_errors=True)
+
+    if project:
+        org = get_org(project.get("org_id"))
+        if org and org.get("mode") == "cloud":
+            try:
+                _remove_manifest_entry(org, project["name"])
+                _git_commit_and_push(org, f"Remove project '{project['name']}'")
+            except ValueError:
+                pass  # best-effort -- a push failure here shouldn't block the local delete that already happened
 
 
 _UNSET = object()  # distinguishes "caller didn't mention retention_days" (keep existing) from an explicit None (clear it)
@@ -554,6 +791,11 @@ def update_project(
     # Same reasoning as add_project: editing a project's folder is just as
     # strong a signal of "this org's stuff lives here now" as creating one.
     set_org_last_browsed_path(updated["org_id"], discovered["project_root"])
+
+    org = get_org(updated["org_id"])
+    if org and org.get("mode") == "cloud":
+        _upsert_manifest_entry(org, updated)
+        _git_commit_and_push(org, f"Update project '{updated['name']}'")
 
     return updated
 
