@@ -101,6 +101,19 @@ _config = _load_or_create_config()
 TOKEN = _config["token"]
 
 
+def _default_local_dir(repo_url: str) -> str:
+    """Derives ~/IaC-Dashboard/Cloud-Sync/<repo-name> from the repo URL, so
+    the agent can just create its own folder instead of making the user
+    pick one -- there's nothing about the folder's location that actually
+    needs a human decision, it just needs to be somewhere stable and
+    obviously-labeled."""
+    repo_name = repo_url.rstrip("/").rsplit("/", 1)[-1]
+    if repo_name.endswith(".git"):
+        repo_name = repo_name[:-4]
+    repo_name = repo_name or "repo"
+    return os.path.join(os.path.expanduser("~"), "IaC-Dashboard", "Cloud-Sync", repo_name)
+
+
 def _resolve_git() -> str:
     git_exe = shutil.which("git")
     if not git_exe:
@@ -299,9 +312,9 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/configure":
                 body = self._read_json_body()
                 repo_url = (body.get("repo_url") or "").strip()
-                local_dir = (body.get("local_dir") or "").strip()
-                if not repo_url or not local_dir:
-                    self._send_json(400, {"error": "repo_url and local_dir are both required"})
+                local_dir = (body.get("local_dir") or "").strip() or _default_local_dir(repo_url)
+                if not repo_url:
+                    self._send_json(400, {"error": "repo_url is required"})
                     return
                 if not os.path.isdir(local_dir) or not os.listdir(local_dir):
                     os.makedirs(local_dir, exist_ok=True)

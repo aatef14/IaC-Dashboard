@@ -600,14 +600,26 @@ const AGENT_URL = "http://127.0.0.1:9876";
 const localSyncPillEl = document.getElementById("local-sync-pill");
 const agentConfigureModalEl = document.getElementById("agent-configure-modal");
 const agentConfigureRepoLabelEl = document.getElementById("agent-configure-repo-label");
+const agentConfigureDefaultPathEl = document.getElementById("agent-configure-default-path");
 const agentTokenInputEl = document.getElementById("agent-token-input");
 const agentLocalDirInputEl = document.getElementById("agent-local-dir-input");
+const agentCustomFolderRowEl = document.getElementById("agent-custom-folder-row");
+const linkAgentCustomFolderEl = document.getElementById("link-agent-custom-folder");
 const agentSetupErrorEl = document.getElementById("agent-setup-error");
 const btnBrowseAgentFolderEl = document.getElementById("btn-browse-agent-folder");
 const btnStartAgentSyncEl = document.getElementById("btn-start-agent-sync");
 
 function agentTokenKey(orgId) {
   return `iac_agent_token_${orgId}`;
+}
+
+// Mirrors sync_agent.py's _default_local_dir -- purely cosmetic (the agent
+// computes and creates the real path itself), just so the modal can show
+// the user where it'll end up before they click Start Syncing.
+function agentDefaultLocalDirLabel(repoUrl) {
+  let repoName = repoUrl.replace(/\/+$/, "").split("/").pop() || "repo";
+  if (repoName.endsWith(".git")) repoName = repoName.slice(0, -4);
+  return `~\\IaC-Dashboard\\Cloud-Sync\\${repoName}`;
 }
 
 async function agentFetch(path, opts = {}) {
@@ -692,10 +704,17 @@ async function triggerManualAgentSync(org) {
 
 function openAgentConfigureModal(org) {
   agentConfigureRepoLabelEl.textContent = org.repo_url;
+  agentConfigureDefaultPathEl.textContent = agentDefaultLocalDirLabel(org.repo_url);
   agentTokenInputEl.value = localStorage.getItem(agentTokenKey(org.id)) || "";
   agentLocalDirInputEl.value = "";
+  agentCustomFolderRowEl.classList.add("hidden");
   agentSetupErrorEl.classList.add("hidden");
   openModal(agentConfigureModalEl);
+
+  linkAgentCustomFolderEl.onclick = (e) => {
+    e.preventDefault();
+    agentCustomFolderRowEl.classList.remove("hidden");
+  };
 
   btnBrowseAgentFolderEl.onclick = async () => {
     agentSetupErrorEl.classList.add("hidden");
@@ -718,8 +737,8 @@ function openAgentConfigureModal(org) {
     agentSetupErrorEl.classList.add("hidden");
     const t = agentTokenInputEl.value.trim();
     const dir = agentLocalDirInputEl.value.trim();
-    if (!t || !dir) {
-      agentSetupErrorEl.textContent = "Enter the token and pick a local folder.";
+    if (!t) {
+      agentSetupErrorEl.textContent = "Paste the agent token first.";
       agentSetupErrorEl.classList.remove("hidden");
       return;
     }
@@ -727,7 +746,7 @@ function openAgentConfigureModal(org) {
       await agentFetch("/configure", {
         method: "POST",
         headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
-        body: JSON.stringify({ repo_url: org.repo_url, local_dir: dir }),
+        body: JSON.stringify(dir ? { repo_url: org.repo_url, local_dir: dir } : { repo_url: org.repo_url }),
       });
       localStorage.setItem(agentTokenKey(org.id), t);
       closeModals();

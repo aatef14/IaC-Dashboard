@@ -545,6 +545,13 @@ h1 {
   gap: 16px;
   flex-wrap: wrap;
 }
+.org-title-main {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+.org-title-main .pill { align-self: flex-start; }
 #org-title-bar h2 {
   margin: 0;
   font-size: 26px;

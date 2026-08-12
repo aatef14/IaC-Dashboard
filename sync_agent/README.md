@@ -30,8 +30,10 @@ this at all; the dashboard already does its own git syncing server-side.
 3. It registers itself to start automatically at every Windows login, so
    after this first run you shouldn't need to launch it by hand again.
 4. On the dashboard website, open the Cloud org you want to sync -- there's
-   a "Local Sync Agent" panel. Paste the token, click **Browse...** to pick
-   a local folder, then **Start Syncing**. It clones the org's repo there.
+   a "Local sync" pill. Click it, paste the token, then **Start Syncing** --
+   no need to pick a folder, the agent creates its own at
+   `~\IaC-Dashboard\Cloud-Sync\<repo-name>` and clones the org's repo there.
+   ("Use a different folder instead..." lets you override that if you want.)
 5. From then on, it **auto-syncs every ~5 minutes** in the background on
    its own -- pulls the latest and pushes anything changed locally, quietly
    (no popup unless you use the manual button). Click **Sync to my
