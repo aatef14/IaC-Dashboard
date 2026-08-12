@@ -711,12 +711,38 @@ def _device_login_html(pending: dict | None) -> str:
       }} catch (e) {{ /* clipboard permission denied -- code is still visible to copy by hand */ }}
     }};
 
+    // Opened via window.open() (not a plain target="_blank" navigation) so
+    // we keep a handle to it -- lets us close that tab ourselves the
+    // moment sign-in completes, instead of leaving GitHub's "you're all
+    // set" page sitting open after you're already back in the dashboard.
+    // Only works if you approved from THIS button; approving from a
+    // different device/tab leaves githubWindow null, which is a harmless
+    // no-op below.
+    let githubWindow = null;
+    linkEl.addEventListener("click", (e) => {{
+      const w = window.open(linkEl.href, "_blank");
+      if (w) {{
+        // Got a handle -- stop the anchor's own navigation so this click
+        // doesn't ALSO open a second tab via its normal target="_blank".
+        e.preventDefault();
+        githubWindow = w;
+      }}
+      // If window.open was blocked (returns null -- a popup-blocking
+      // extension, strict Brave Shields settings, etc.), don't
+      // preventDefault: let the anchor's own target="_blank" navigation
+      // go through normally instead, same as before this feature existed.
+      // Auto-close just silently won't apply to that tab.
+    }});
+
     async function poll() {{
       try {{
         const res = await fetch("/auth/device/status");
         const body = await res.json();
         if (body.status === "complete") {{
           statusEl.innerHTML = "Signed in! Redirecting&hellip;";
+          if (githubWindow && !githubWindow.closed) {{
+            try {{ githubWindow.close(); }} catch (e) {{ /* ignore */ }}
+          }}
           window.location.href = "/";
           return;
         }}
