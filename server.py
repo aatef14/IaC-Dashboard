@@ -1039,6 +1039,12 @@ async def api_initialize_project_folder(request: Request):
     if "project_root" not in body:
         return JSONResponse({"error": "missing 'project_root'"}, status_code=400)
     try:
+        # Checked here too, not just in add_project -- this step already
+        # WRITES the scaffolded files, so without this an out-of-repo
+        # folder would get real (wasted) files on disk before add_project
+        # ever gets a chance to reject it.
+        if body.get("org_id"):
+            rm.check_project_root_for_org(body["org_id"], body["project_root"])
         result = await asyncio.to_thread(rm.initialize_project_folder, body["project_root"])
         return JSONResponse(result)
     except ValueError as e:

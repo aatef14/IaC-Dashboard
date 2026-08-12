@@ -1381,7 +1381,7 @@ btnInitializeFolderEl.onclick = async () => {
     const result = await api("/api/project/initialize", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_root: projectRoot }),
+      body: JSON.stringify({ project_root: projectRoot, org_id: currentOrg ? currentOrg.id : null }),
     });
     discoveredDeployments = result.deployments;
     deploymentSelectEl.innerHTML = discoveredDeployments

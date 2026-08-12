@@ -385,6 +385,40 @@ def sync_cloud_org(org_id: str) -> dict:
     return {"pulled": pulled, "warning": warning}
 
 
+def check_project_root_for_org(org_id: str, project_root: str):
+    """Public wrapper for _require_project_root_under_cloud_repo -- lets
+    server.py validate at the "Initialize new folder" scaffold step too
+    (which writes files immediately, before add_project ever gets a
+    chance to reject an out-of-repo path). No-op for an unknown org_id or
+    a Local org, same as the underlying check."""
+    org = get_org(org_id)
+    if org:
+        _require_project_root_under_cloud_repo(org, project_root)
+
+
+def _require_project_root_under_cloud_repo(org: dict, project_root: str):
+    """A Cloud org's whole point is that its projects live in the shared
+    repo -- but nothing before this stopped you from typing (or Browse-ing
+    to) a folder outside it, which would silently create a project that
+    never actually gets pushed/synced anywhere. Browse defaults into the
+    clone (set_org_last_browsed_path), but that's just a convenience
+    default, not an enforced boundary -- this is the actual boundary."""
+    if org.get("mode") != "cloud":
+        return
+    repo_root = os.path.normpath(org["local_repo_path"])
+    candidate = os.path.normpath(project_root)
+    try:
+        inside = os.path.commonpath([repo_root, candidate]) == repo_root
+    except ValueError:
+        inside = False  # e.g. different drive letters on Windows
+    if not inside:
+        raise ValueError(
+            f"'{org['name']}' is a Cloud organization -- the project folder must be inside its cloned repo "
+            f"('{repo_root}'), not '{project_root}'. Browse from there (it's the default), or type a path "
+            "under it."
+        )
+
+
 # ===================================================================================
 # PROJECTS (persisted)
 # ===================================================================================
@@ -605,6 +639,8 @@ def add_project(
     org = get_org(org_id)
     if org is None:
         raise ValueError("unknown org_id -- create an organization first")
+    if not _from_manifest:
+        _require_project_root_under_cloud_repo(org, project_root)
 
     name = _validate_name(name, "project")
     retention_days = _validate_retention_days(retention_days)
@@ -757,6 +793,9 @@ def update_project(
     existing = get_project(project_id)
     if existing is None:
         raise ValueError("unknown project_id")
+    org = get_org(existing["org_id"])
+    if org:
+        _require_project_root_under_cloud_repo(org, project_root)
 
     discovered = discover_project(project_root)
     dep_names = [d["name"] for d in discovered["deployments"]]
@@ -792,7 +831,6 @@ def update_project(
     # strong a signal of "this org's stuff lives here now" as creating one.
     set_org_last_browsed_path(updated["org_id"], discovered["project_root"])
 
-    org = get_org(updated["org_id"])
     if org and org.get("mode") == "cloud":
         _upsert_manifest_entry(org, updated)
         _git_commit_and_push(org, f"Update project '{updated['name']}'")
