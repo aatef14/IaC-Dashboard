@@ -2648,6 +2648,31 @@ const graphErrorEl = document.getElementById("graph-error");
 const graphLegendEl = document.getElementById("graph-legend");
 const graphContainerEl = document.getElementById("graph-container");
 const chkGraphGroupModulesEl = document.getElementById("chk-graph-group-modules");
+const graphDetailEmptyEl = document.getElementById("graph-detail-empty");
+const graphDetailContentEl = document.getElementById("graph-detail-content");
+const graphDetailTitleEl = document.getElementById("graph-detail-title");
+const graphDependsOnListEl = document.getElementById("graph-depends-on-list");
+const graphUsedByListEl = document.getElementById("graph-used-by-list");
+const btnCloseGraphDetailEl = document.getElementById("btn-close-graph-detail");
+
+// address -> [addresses it depends on] / [addresses that depend on it] --
+// rebuilt from the edge list every time the graph reloads (initial load or
+// the "Group by module" toggle), since a collapsed module id isn't the
+// same node space as the per-resource view.
+let graphDependsOn = new Map();
+let graphUsedBy = new Map();
+let graphSelectedNode = null;
+
+function buildGraphDependencyMaps(edges) {
+  graphDependsOn = new Map();
+  graphUsedBy = new Map();
+  for (const [from, to] of edges) {
+    if (!graphDependsOn.has(from)) graphDependsOn.set(from, []);
+    graphDependsOn.get(from).push(to);
+    if (!graphUsedBy.has(to)) graphUsedBy.set(to, []);
+    graphUsedBy.get(to).push(from);
+  }
+}
 
 // Mirrors run_manager.py's _GRAPH_CATEGORY_STYLES -- just the "color" value
 // from each category, purely for the legend key. The actual SVG arrives
@@ -2695,29 +2720,75 @@ async function showDependencyGraph(project, { pushHistory = true } = {}) {
   await loadGraphSvg();
 }
 
-// Not api() -- that assumes a JSON body, but this endpoint returns raw SVG
-// (image/svg+xml) straight through so the browser never has to round-trip
-// it through JSON string-escaping. Re-fetches whenever the "Group by
-// module" toggle changes, not just on the initial view load.
+// Re-fetches whenever the "Group by module" toggle changes, not just on
+// the initial view load -- the edge list drives the click-to-inspect
+// panel, so it has to be rebuilt every time right alongside the SVG.
 async function loadGraphSvg() {
   graphErrorEl.classList.add("hidden");
   graphContainerEl.innerHTML = `<p class="muted">Loading…</p>`;
+  closeGraphDetail();
   const query = chkGraphGroupModulesEl.checked ? "?group=modules" : "";
   try {
-    const res = await fetch(`/api/projects/${currentProject.id}/dependency-graph${query}`);
-    const text = await res.text();
-    if (!res.ok) {
-      const body = JSON.parse(text);
-      throw new Error(body.error || `HTTP ${res.status}`);
-    }
-    graphContainerEl.innerHTML = text;
+    const data = await api(`/api/projects/${currentProject.id}/dependency-graph${query}`);
+    graphContainerEl.innerHTML = data.svg;
+    buildGraphDependencyMaps(data.edges);
   } catch (e) {
     graphErrorEl.textContent = e.message;
     graphErrorEl.classList.remove("hidden");
     graphContainerEl.innerHTML = "";
+    buildGraphDependencyMaps([]);
   }
 }
 chkGraphGroupModulesEl.onchange = loadGraphSvg;
+
+function graphDetailListHtml(addresses) {
+  if (!addresses || !addresses.length) return `<li class="graph-detail-empty-msg">none</li>`;
+  return addresses
+    .map((addr) => `<li><button class="graph-detail-item" data-node="${escapeHtml(addr)}">${escapeHtml(addr)}</button></li>`)
+    .join("");
+}
+
+function selectGraphNode(nodeId) {
+  graphSelectedNode = nodeId;
+  graphDetailEmptyEl.classList.add("hidden");
+  graphDetailContentEl.classList.remove("hidden");
+  graphDetailTitleEl.textContent = nodeId;
+  graphDependsOnListEl.innerHTML = graphDetailListHtml(graphDependsOn.get(nodeId));
+  graphUsedByListEl.innerHTML = graphDetailListHtml(graphUsedBy.get(nodeId));
+
+  // Highlight the selected node and dim everything else, so the "what
+  // connects to what" answer in the panel has an obvious visual anchor
+  // back in the graph itself, not just a text list floating next to it.
+  for (const nodeEl of graphContainerEl.querySelectorAll(".node")) {
+    const title = nodeEl.querySelector("title")?.textContent;
+    nodeEl.classList.toggle("graph-node-selected", title === nodeId);
+    nodeEl.classList.toggle("graph-node-dimmed", title !== nodeId);
+  }
+}
+
+function closeGraphDetail() {
+  graphSelectedNode = null;
+  graphDetailContentEl.classList.add("hidden");
+  graphDetailEmptyEl.classList.remove("hidden");
+  for (const nodeEl of graphContainerEl.querySelectorAll(".node")) {
+    nodeEl.classList.remove("graph-node-selected", "graph-node-dimmed");
+  }
+}
+btnCloseGraphDetailEl.onclick = closeGraphDetail;
+
+// Delegated rather than per-node: the SVG (and every .node inside it) gets
+// replaced wholesale on every load/toggle, so listeners attached directly
+// to nodes would just be thrown away each time.
+graphContainerEl.addEventListener("click", (ev) => {
+  const nodeEl = ev.target.closest(".node");
+  if (!nodeEl) return;
+  const title = nodeEl.querySelector("title")?.textContent;
+  if (title) selectGraphNode(title);
+});
+document.getElementById("graph-detail-content").addEventListener("click", (ev) => {
+  const btn = ev.target.closest(".graph-detail-item");
+  if (btn) selectGraphNode(btn.dataset.node);
+});
 
 btnViewGraphEl.onclick = () => {
   const url = `/graph/${encodeURIComponent(currentOrg.name)}/${encodeURIComponent(currentProject.name)}`;

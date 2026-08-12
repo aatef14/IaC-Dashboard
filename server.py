@@ -809,14 +809,16 @@ async def api_module_and_provider_sources(request: Request):
 @server.custom_route("/api/projects/{project_id}/dependency-graph", methods=["GET"])
 async def api_dependency_graph(request: Request):
     """Styled SVG of this project's terraform dependency graph
-    (terraform graph | dot -Tsvg, colour-coded by resource category).
-    ?group=modules collapses each module to a single node -- the
-    per-resource view on a real deployment is a hairball, this is the
-    "what depends on what" view instead."""
+    (terraform graph | dot -Tsvg, colour-coded by resource category) plus
+    its raw edge list, as {svg, edges} -- the edges drive the click-to-
+    inspect "what does this depend on" panel. ?group=modules collapses
+    each module to a single node -- the per-resource view on a real
+    deployment is a hairball, this is the "what depends on what" view
+    instead."""
     group_by_module = request.query_params.get("group") == "modules"
     try:
-        svg = await asyncio.to_thread(rm.get_dependency_graph_svg, request.path_params["project_id"], group_by_module)
-        return Response(svg, media_type="image/svg+xml")
+        result = await asyncio.to_thread(rm.get_dependency_graph, request.path_params["project_id"], group_by_module)
+        return JSONResponse(result)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)
 

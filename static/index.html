@@ -217,7 +217,22 @@
     </div>
     <p id="graph-error" class="warn-text hidden"></p>
     <div id="graph-legend" class="graph-legend"></div>
-    <div id="graph-container" class="graph-container"><p class="muted">Loading…</p></div>
+    <div id="graph-body">
+      <div id="graph-container" class="graph-container"><p class="muted">Loading…</p></div>
+      <aside id="graph-detail-panel">
+        <p id="graph-detail-empty" class="muted">Click any resource or module in the graph to see what it depends on.</p>
+        <div id="graph-detail-content" class="hidden">
+          <div class="graph-detail-title-row">
+            <span id="graph-detail-title" class="graph-detail-title"></span>
+            <button id="btn-close-graph-detail" class="btn" aria-label="Close">&times;</button>
+          </div>
+          <h4>Depends on</h4>
+          <ul id="graph-depends-on-list" class="graph-detail-list"></ul>
+          <h4>Used by</h4>
+          <ul id="graph-used-by-list" class="graph-detail-list"></ul>
+        </div>
+      </aside>
+    </div>
   </main>
 
   <!-- ===================== MODALS ===================== -->

@@ -88,7 +88,19 @@ foreach ($key in $results.Keys) {
     Write-Host "  [$status] $key"
 }
 
-Write-Host "`nNext steps:"
-Write-Host "  1. az login   (sign in to the Azure account this dashboard should manage infrastructure for)"
-Write-Host "  2. .\start.ps1"
-Write-Host "  3. open http://127.0.0.1:8765/"
+$coreToolsReady = $results["Python 3.10+"] -and $results["Terraform"] -and $results["Azure CLI"] -and $results["Git (Git Bash, for the in-app terminal)"]
+
+if (-not $coreToolsReady) {
+    Write-Host "`nOne or more required tools are still missing (see above)."
+    Write-Host "Install them, then re-run this script or just run .\start.ps1 once they're on PATH."
+    exit 0
+}
+
+$azAccount = az account show 2>$null
+if (-not $azAccount) {
+    Write-Host "`nNot signed in to Azure yet. Run 'az login' before creating/applying any real infrastructure."
+    Write-Host "(You can still start the dashboard and browse/plan without it.)"
+}
+
+Write-Host "`nSetup complete -- starting the dashboard now..."
+& (Join-Path $root "start.ps1")

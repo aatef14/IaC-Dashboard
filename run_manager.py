@@ -1026,14 +1026,17 @@ def _collapse_to_module(node_id: str) -> str:
     return m.group(1) if m else node_id
 
 
-def _build_module_level_graph_dot(dot_source: str) -> str:
+def _build_module_level_graph_dot(dot_source: str) -> tuple[str, list[tuple[str, str]]]:
     """A real deployment's per-resource graph (dozens of resources, dense
     cross-module dependencies) reads as a hairball -- this collapses every
     resource inside a module.* into ONE node representing that module,
     answering "what depends on what" at a scale that's actually readable.
     Builds a fresh, minimal DOT from scratch (just the collapsed node/edge
     set) rather than patching terraform's original -- there's no cluster
-    structure left to preserve once modules themselves become the nodes."""
+    structure left to preserve once modules themselves become the nodes.
+    Returns (dot_source, edges) -- the caller needs the edge list itself
+    (not just embedded in the DOT/SVG) to answer "what does X depend on"
+    when a node gets clicked, without re-parsing the rendered SVG."""
     node_ids = set(_GRAPH_NODE_LINE_RE.findall(dot_source))
     edges = _GRAPH_EDGE_RE.findall(dot_source)
 
@@ -1057,7 +1060,7 @@ def _build_module_level_graph_dot(dot_source: str) -> str:
 
     lines = [
         "digraph G {",
-        '  rankdir = "LR";',
+        '  rankdir = "TB";',
         '  bgcolor = "transparent";',
         '  splines = "line";',
         "  concentrate = true;",
@@ -1075,20 +1078,21 @@ def _build_module_level_graph_dot(dot_source: str) -> str:
         style = _GRAPH_CATEGORY_STYLES["network"] if node_id.startswith("module.") else _GRAPH_CATEGORY_STYLES[_classify_graph_node(node_id)]
         escaped = node_id.replace('"', '\\"')
         lines.append(f'  "{escaped}" [label="{escaped}", fillcolor="{style["fillcolor"]}", color="{style["color"]}", fontcolor="{style["fontcolor"]}"];')
-    for a, b in sorted(collapsed_edges):
+    sorted_edges = sorted(collapsed_edges)
+    for a, b in sorted_edges:
         escaped_a = a.replace('"', '\\"')
         escaped_b = b.replace('"', '\\"')
         lines.append(f'  "{escaped_a}" -> "{escaped_b}";')
     lines.append("}")
-    return "\n".join(lines)
+    return "\n".join(lines), sorted_edges
 
 
 def _style_dependency_graph_dot(dot_source: str) -> str:
     """Takes terraform graph's plain black-and-white DOT output and layers
     styling on top: transparent background, rounded/filled nodes colour-
     coded by _classify_graph_node, softly-tinted rounded module clusters,
-    and a left-to-right layout (reads better than terraform's default
-    right-to-left in a wide browser panel). Done by string/regex
+    and a top-to-bottom tree layout (reads as an actual tree diagram,
+    unlike terraform's default right-to-left). Done by string/regex
     insertion rather than a full DOT parser -- appending an extra
     attribute statement for a node Graphviz already knows about merges
     with (doesn't replace) its earlier `label=...` attribute, so this
@@ -1096,7 +1100,7 @@ def _style_dependency_graph_dot(dot_source: str) -> str:
     to them. If terraform's output format ever shifts enough that the
     anchor strings below don't match, the .replace() calls are no-ops --
     this degrades to an unstyled-but-still-correct graph, never an error."""
-    dot_source = dot_source.replace('rankdir = "RL";', 'rankdir = "LR";')
+    dot_source = dot_source.replace('rankdir = "RL";', 'rankdir = "TB";')
     dot_source = dot_source.replace(
         'node [shape = rect, fontname = "sans-serif"];',
         'node [shape = rect, fontname = "Segoe UI, sans-serif", style="filled,rounded", '
@@ -1131,7 +1135,7 @@ def _style_dependency_graph_dot(dot_source: str) -> str:
     return dot_source
 
 
-def get_dependency_graph_svg(project_id: str, group_by_module: bool = False) -> str:
+def get_dependency_graph(project_id: str, group_by_module: bool = False) -> dict:
     """Renders this project's terraform dependency graph (`terraform graph`
     piped through Graphviz's `dot`) as a styled, colour-coded SVG --
     read-only, no Azure calls. Requires init to have succeeded (terraform
@@ -1141,7 +1145,13 @@ def get_dependency_graph_svg(project_id: str, group_by_module: bool = False) -> 
     (see _build_module_level_graph_dot) -- the per-resource view is exact
     but can be a real hairball on a deployment with a few dozen resources;
     the module-level view trades that detail for something actually
-    readable at a glance."""
+    readable at a glance.
+
+    Returns {"svg": ..., "edges": [[from, to], ...]} rather than just the
+    SVG -- "from depends on to" is exactly what a click-to-inspect UI needs
+    to answer "what does this depend on / what depends on this," and
+    that's much easier to compute from a real edge list than by re-parsing
+    the rendered SVG's <title> text back out."""
     project = get_project(project_id)
     if project is None:
         raise ValueError("unknown project_id")
@@ -1154,9 +1164,11 @@ def get_dependency_graph_svg(project_id: str, group_by_module: bool = False) -> 
     if graph_proc.returncode != 0:
         raise ValueError(f"terraform graph failed: {(graph_proc.stderr or graph_proc.stdout).strip()}")
 
-    dot_source = (
-        _build_module_level_graph_dot(graph_proc.stdout) if group_by_module else _style_dependency_graph_dot(graph_proc.stdout)
-    )
+    if group_by_module:
+        dot_source, edges = _build_module_level_graph_dot(graph_proc.stdout)
+    else:
+        dot_source = _style_dependency_graph_dot(graph_proc.stdout)
+        edges = _GRAPH_EDGE_RE.findall(graph_proc.stdout)
 
     try:
         dot_exe = _resolve_executable("dot")
@@ -1165,7 +1177,7 @@ def get_dependency_graph_svg(project_id: str, group_by_module: bool = False) -> 
     svg_proc = subprocess.run([dot_exe, "-Tsvg"], input=dot_source, capture_output=True, text=True, timeout=30)
     if svg_proc.returncode != 0:
         raise ValueError(f"dot failed to render the graph: {(svg_proc.stderr or '').strip()}")
-    return svg_proc.stdout
+    return {"svg": svg_proc.stdout, "edges": [list(e) for e in edges]}
 
 
 # ===================================================================================

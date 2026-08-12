@@ -56,33 +56,45 @@ Requirements:
   else). Get it from [python.org](https://python.org) (check "Add
   python.exe to PATH" during install) if you don't have it.
 
-Setup:
+Setup -- clone it, run one script, done:
 
 ```powershell
 git clone https://github.com/aatef14/IaC-Dashboard.git
 cd IaC-Dashboard
 .\install.ps1
-az login
-.\start.ps1
 ```
 
-`install.ps1` checks for every external tool this dashboard shells out to --
-**Terraform**, **Azure CLI**, **Git** (Git Bash, used by the in-app
-terminal), **Graphviz** (used by the dependency graph view) -- and installs
-whichever are missing via `winget`, then runs `pip install -r
-requirements.txt` for the Python side. Safe to re-run any time; every check
-is a no-op if the tool's already there, and it never touches your saved
-projects/orgs/run history. Prints a summary at the end so you can see at a
-glance what's covered and what (if anything) needs installing by hand --
-**VS Code's `code` CLI** is the one thing it only checks, never installs,
-since it's entirely optional (only needed for the **Open in VS Code**
-button; the in-app editor works without it) -- VS Code's own Command
-Palette -> "Shell Command: Install 'code' command in PATH" adds it if you
-want it.
+That's it. `install.ps1` checks for every external tool this dashboard shells
+out to -- **Terraform**, **Azure CLI**, **Git** (Git Bash, used by the
+in-app terminal), **Graphviz** (used by the dependency graph view) -- and
+installs whichever are missing via `winget` (Windows' built-in package
+manager, no manual downloads), then runs `pip install -r requirements.txt`
+for the Python side. Safe to re-run any time; every check is a no-op if the
+tool's already there, and it never touches your saved projects/orgs/run
+history. Prints a summary at the end so you can see at a glance what's
+covered and what (if anything) needs installing by hand -- **VS Code's
+`code` CLI** is the one thing it only checks, never installs, since it's
+entirely optional (only needed for the **Open in VS Code** button; the
+in-app editor works without it) -- VS Code's own Command Palette -> "Shell
+Command: Install 'code' command in PATH" adds it if you want it.
 
-Then open http://127.0.0.1:8765/. First run creates `organizations.json`,
-`projects.json`, `runs.db`, and `project-data/` next to the code -- all
-git-ignored, all yours, nothing shared with anyone else who clones this repo.
+Once every required tool is present, `install.ps1` automatically runs
+`start.ps1` for you -- **the dashboard opens in your default browser** at
+the end of setup, no separate step needed. If any required tool is still
+missing (e.g. `winget` itself isn't available, or Python wasn't
+pre-installed), it tells you exactly what to install and stops there --
+re-run `.\install.ps1` (or just `.\start.ps1` once tools are on PATH) after
+fixing it.
+
+You'll also want to run `az login` at some point to sign in to the Azure
+account this dashboard should manage infrastructure for -- you can do this
+before or after `install.ps1`; it's only needed once you actually plan/apply
+against real infrastructure (browsing and planning UI works without it, and
+a **Not Authenticated** pill just reminds you it's still needed).
+
+First run creates `organizations.json`, `projects.json`, `runs.db`, and
+`project-data/` next to the code -- all git-ignored, all yours, nothing
+shared with anyone else who clones this repo.
 
 There's nothing to configure before first use: no config file, no
 environment variables, no storage account to pre-register. Everything --
@@ -94,17 +106,25 @@ below). The one thing you bring yourself is a Terraform project shaped like
 the layout in "Expected folder structure" -- this dashboard drives
 `terraform`, it doesn't replace writing your own `.tf` files.
 
-Binds to `127.0.0.1` only, by design -- this can run `terraform apply`
-against real cloud infrastructure, and it has no authentication of its own.
-Never expose it beyond localhost; if several people need it, each runs their
-own instance against their own Azure login.
+Binds to all network interfaces (`0.0.0.0`) by default, so it stays reachable
+at your machine's current LAN IP no matter which Wi-Fi/network you're on --
+`start.ps1` auto-detects and prints that IP every time it starts. **It has
+no authentication of its own** and can run real `terraform apply` calls
+against real cloud infrastructure, write to real files, and open a real
+shell -- so treat that LAN reachability as "anyone on this network can drive
+this dashboard," not just a convenience. If you want it restricted back to
+just this machine, set `$env:IAC_DASHBOARD_HOST = "127.0.0.1"` before
+running `.\start.ps1`. If several people need their own dashboard, each
+should run their own instance against their own Azure login rather than
+sharing one.
 
 ## Starting / stopping
 
-Runs detached in the background so it survives closing the terminal.
+Runs detached in the background so it survives closing the terminal, and
+opens your default browser to it automatically.
 
 ```powershell
-.\start.ps1   # starts it, prints the PID and URLs
+.\start.ps1   # starts it, prints the PID + local/LAN URLs, opens your browser
 .\stop.ps1    # stops it
 ```
 
@@ -289,7 +309,7 @@ ever be a human clicking a button, never an agent deciding to do it.
 | `projects.json` | Saved Work Projects (org_id, name, folder, deployment, environment, cloud_provider) |
 | `project-data/<project_id>/runs/<run_id>/` | Everything one plan run produced (`plan.tfplan`, `diff.json`) -- lives here, NOT inside the actual Terraform repo, so the dashboard never writes anything into your IaC project folder |
 | `static/` | Dashboard HTML/CSS/JS |
-| `install.ps1` | One-shot setup: checks/installs Terraform, Azure CLI, Git, Graphviz via `winget`, then `pip install`s the Python side |
+| `install.ps1` | One-shot setup: checks/installs Terraform, Azure CLI, Git, Graphviz via `winget`, `pip install`s the Python side, then runs `start.ps1` |
 | `start.ps1` / `stop.ps1` | Background process management (PID tracked in `.server.pid`) |
 | `Dockerfile` / `docker-compose.yml` / `.dockerignore` | Container image (Python + Terraform + Azure CLI) -- see **Running with Docker** above |
 

@@ -1682,9 +1682,17 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
   color: var(--muted);
 }
 .graph-legend-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+
+#graph-body {
+  flex: 1;
+  display: flex;
+  gap: 14px;
+  min-height: 0;
+}
 .graph-container {
   flex: 1;
   min-height: 0;
+  min-width: 0;
   background: linear-gradient(180deg, #1a2340 0%, #131a30 100%);
   border: 1px solid rgba(37, 99, 235, 0.3);
   border-radius: var(--r-md);
@@ -1694,6 +1702,56 @@ input:disabled, select:disabled { opacity: 0.55; cursor: not-allowed; }
   text-align: center;
 }
 .graph-container svg { max-width: none; }
+.graph-container .node { cursor: pointer; }
+.graph-container .node.graph-node-selected polygon,
+.graph-container .node.graph-node-selected path {
+  stroke: #ffffff !important;
+  stroke-width: 2.5px !important;
+}
+.graph-container .node.graph-node-dimmed { opacity: 0.32; }
+
+#graph-detail-panel {
+  flex: none;
+  width: 260px;
+  background: var(--surface);
+  backdrop-filter: blur(18px) saturate(150%);
+  -webkit-backdrop-filter: blur(18px) saturate(150%);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  box-shadow: var(--shadow);
+  padding: 16px;
+  overflow-y: auto;
+}
+#graph-detail-empty { font-size: 12.5px; text-align: center; margin-top: 20px; }
+.graph-detail-title-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+.graph-detail-title {
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 12px;
+  font-weight: 650;
+  color: var(--brand-ink);
+  word-break: break-word;
+}
+#btn-close-graph-detail { flex: none; font-size: 14px; line-height: 1; padding: 3px 8px; }
+#graph-detail-content h4 { font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 16px 0 6px; font-weight: 700; }
+.graph-detail-list { list-style: none; margin: 0; padding: 0; }
+.graph-detail-list li { margin-bottom: 4px; }
+.graph-detail-list .graph-detail-empty-msg { font-size: 12px; color: var(--muted); font-style: italic; }
+.graph-detail-item {
+  display: block;
+  width: 100%;
+  text-align: left;
+  background: none;
+  border: none;
+  border-radius: var(--r-sm);
+  padding: 6px 8px;
+  font-family: "Cascadia Mono", Consolas, monospace;
+  font-size: 11.5px;
+  color: var(--text);
+  cursor: pointer;
+  word-break: break-word;
+  transition: background 0.12s ease;
+}
+.graph-detail-item:hover { background: var(--brand-wash); color: var(--brand-deep); }
 
 /* ---------- state resource browser ---------- */
 
