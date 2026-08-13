@@ -385,8 +385,6 @@
 
     <div id="add-org-modal" class="modal hidden">
       <h2>New Organization</h2>
-      <label class="field-label">Name</label>
-      <input id="org-name-input" placeholder="e.g. Acme-Corp (no spaces)" />
 
       <div id="org-mode-tabs" class="tabs">
         <button type="button" id="tab-org-local" class="tab active" data-mode="local">Local</button>
@@ -400,6 +398,7 @@
           pushed to, this repo -- so anyone who creates an org with the same name and this same repo URL sees the
           same projects. Uses whatever git credentials already work on this machine; make sure it's a
           <b>private</b> repo, since real project data gets committed into it.</p>
+        <div id="org-discover-info" class="hint-banner hidden"></div>
 
         <label class="field-label">Clone location (optional)</label>
         <div class="confirm-row">
@@ -408,7 +407,10 @@
         </div>
         <p class="muted">Where the repo gets cloned to on this machine. Must be an empty (or not-yet-existing) folder.</p>
       </div>
-      <div id="org-discover-info" class="hint-banner hidden"></div>
+
+      <label class="field-label">Name</label>
+      <input id="org-name-input" placeholder="e.g. Acme-Corp (no spaces)" />
+
       <div id="add-org-warning" class="warn-text hidden"></div>
       <div id="add-org-error" class="warn-text hidden"></div>
       <div class="modal-actions">
