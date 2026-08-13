@@ -168,6 +168,11 @@ def add_org(name: str, mode: str = "local", repo_url: str | None = None, clone_p
 
     if mode == "cloud":
         set_org_last_browsed_path(org_id, org["local_repo_path"])
+        try:
+            _write_org_meta_if_missing(org)
+            _git_commit_and_push(org, f"Initialize org metadata for '{name}'")
+        except Exception:
+            pass  # best-effort -- a push failure here shouldn't block org creation that already succeeded locally
         _sync_projects_from_manifest(org)
 
     return {**org, "warning": warning} if warning else org
@@ -345,6 +350,67 @@ def _upsert_manifest_entry(org: dict, project: dict):
     entries = [e for e in _read_manifest(org) if e["name"] != project["name"]]
     entries.append(_manifest_entry_for(project, org))
     _write_manifest(org, entries)
+
+
+_ORG_META_RELATIVE_PATH = os.path.join(".iac-dashboard", "org.json")
+
+
+def _org_meta_path(org: dict) -> str:
+    return os.path.join(org["local_repo_path"], _ORG_META_RELATIVE_PATH)
+
+
+def _read_org_meta(org: dict) -> dict | None:
+    path = _org_meta_path(org)
+    if not os.path.exists(path):
+        return None
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _write_org_meta_if_missing(org: dict):
+    """Writes this org's name into the repo itself (.iac-dashboard/org.json)
+    the first time anyone creates/pushes it -- otherwise the name only ever
+    lived in whoever-created-it's own local organizations.json, so a second
+    person adding the same repo later had no way to discover what to call
+    it except being told out of band. First-writer-wins (never overwrites
+    an existing org.json): two people could otherwise fight over the name
+    shown if they'd each already been calling their own org record
+    something slightly different before this existed."""
+    if os.path.exists(_org_meta_path(org)):
+        return
+    path = _org_meta_path(org)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"name": org["name"]}, f, indent=2)
+
+
+def discover_cloud_repo(repo_url: str) -> dict:
+    """Clones repo_url to a throwaway temp dir just to read what's already
+    there -- org.json's name (if a previous org already wrote one) and the
+    project manifest -- without creating a real org record. Lets "New
+    Organization" pre-fill the name and warn "this repo already has an org
+    in it" instead of only finding that out after typing a name and
+    clicking Create."""
+    repo_url = (repo_url or "").strip()
+    if not repo_url:
+        raise ValueError("a Git repo URL is required")
+    tmp_dir = tempfile.mkdtemp(prefix="iac-dashboard-discover-")
+    try:
+        repo_dir = os.path.join(tmp_dir, "repo")
+        _clone_cloud_repo(repo_url, repo_dir)
+        probe_org = {"local_repo_path": repo_dir}
+        meta = _read_org_meta(probe_org)
+        manifest = _read_manifest(probe_org)
+        return {
+            "initialized": bool(meta or manifest),
+            "org_name": meta["name"] if meta else None,
+            "projects": [
+                {"name": e["name"], "deployment": e.get("deployment"), "environment": e.get("environment")}
+                for e in manifest
+            ],
+        }
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 def _remove_manifest_entry(org: dict, project_name: str):

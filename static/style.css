@@ -1561,6 +1561,19 @@ h1 {
 
 .warn-text { color: var(--amber); font-size: 13px; margin: 8px 0; line-height: 1.55; }
 
+.hint-banner {
+  background: var(--surface-strong);
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--brand);
+  border-radius: var(--r-sm, 8px);
+  padding: 10px 12px;
+  font-size: 13px;
+  line-height: 1.55;
+  margin: 10px 0;
+}
+.hint-banner b { color: var(--brand-ink); }
+.hint-banner ul { margin: 6px 0 0; padding-left: 18px; }
+
 .stale-plan-note {
   margin-top: 10px;
   font-size: 12.5px;

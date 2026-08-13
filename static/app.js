@@ -1402,6 +1402,8 @@ projectSearchInputEl.addEventListener("input", renderFilteredProjects);
 // ---------- add organization modal ----------
 
 let addOrgMode = "local";
+const orgDiscoverInfoEl = document.getElementById("org-discover-info");
+let lastDiscoveredRepoUrl = null; // avoids re-probing (another clone+network call) if the URL hasn't actually changed
 
 function setOrgMode(mode) {
   addOrgMode = mode;
@@ -1412,9 +1414,48 @@ function setOrgMode(mode) {
     mode === "cloud"
       ? "Cloud: this org's projects live in a Git repo -- anyone who creates an org with the same name + repo URL sees the same projects."
       : "Local: everything stays on this machine only (the default, unchanged).";
+  if (mode !== "cloud") orgDiscoverInfoEl.classList.add("hidden");
 }
 tabOrgLocalEl.onclick = () => setOrgMode("local");
 tabOrgCloudEl.onclick = () => setOrgMode("cloud");
+
+// Probes the repo (a real, throwaway clone server-side) as soon as a
+// Cloud repo URL is entered -- if someone else already initialized an org
+// in it, this is what lets "New Organization" pre-fill the name and warn
+// instead of silently creating a second, differently-named org record
+// pointed at the exact same repo and projects.
+async function discoverOrgFromRepo() {
+  const repoUrl = orgRepoUrlInputEl.value.trim();
+  if (!repoUrl || repoUrl === lastDiscoveredRepoUrl) return;
+  lastDiscoveredRepoUrl = repoUrl;
+  orgDiscoverInfoEl.classList.remove("hidden");
+  orgDiscoverInfoEl.textContent = "Checking this repo…";
+  try {
+    const result = await api("/api/organizations/discover", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ repo_url: repoUrl }),
+    });
+    if (!result.initialized) {
+      orgDiscoverInfoEl.classList.add("hidden");
+      return;
+    }
+    const projectList = result.projects.length
+      ? `<ul>${result.projects.map((p) => `<li>${escapeHtml(p.name)}</li>`).join("")}</ul>`
+      : "<i>no projects in it yet</i>";
+    if (result.org_name) {
+      orgDiscoverInfoEl.innerHTML = `This repo already has an org named <b>${escapeHtml(
+        result.org_name
+      )}</b> with ${result.projects.length} project(s):${projectList}Using that name below will pick up its existing projects automatically. If you meant to start something new, use a different, empty repo instead.`;
+      if (!orgNameInputEl.value.trim()) orgNameInputEl.value = result.org_name;
+    } else {
+      orgDiscoverInfoEl.innerHTML = `This repo already has ${result.projects.length} project(s) in it (from before org names were stored in the repo):${projectList}Name your org to match whatever the other person(s) using it call it, or use a different, empty repo instead.`;
+    }
+  } catch (e) {
+    orgDiscoverInfoEl.textContent = `Could not check this repo: ${e.message}`;
+  }
+}
+orgRepoUrlInputEl.addEventListener("blur", discoverOrgFromRepo);
 
 btnAddOrgEl.onclick = () => {
   orgNameInputEl.value = "";
@@ -1422,6 +1463,8 @@ btnAddOrgEl.onclick = () => {
   orgClonePathInputEl.value = "";
   addOrgErrorEl.classList.add("hidden");
   addOrgWarningEl.classList.add("hidden");
+  orgDiscoverInfoEl.classList.add("hidden");
+  lastDiscoveredRepoUrl = null;
   setOrgMode("local");
   openModal(addOrgModalEl);
 };

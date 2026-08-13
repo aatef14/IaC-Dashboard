@@ -1099,6 +1099,25 @@ async def api_add_org(request: Request):
         return JSONResponse({"error": str(e)}, status_code=400)
 
 
+@server.custom_route("/api/organizations/discover", methods=["POST"])
+async def api_discover_cloud_repo(request: Request):
+    """Probes a repo URL before creating an org from it -- lets "New
+    Organization" pre-fill the name and warn "this repo already has an org
+    in it" instead of only finding that out after typing a name and
+    clicking Create. Does a real (throwaway) clone, so it's a network call
+    like add_org itself."""
+    body, err = await _json_body(request)
+    if err:
+        return err
+    if "repo_url" not in body:
+        return JSONResponse({"error": "missing 'repo_url'"}, status_code=400)
+    try:
+        result = await asyncio.to_thread(rm.discover_cloud_repo, body["repo_url"])
+        return JSONResponse(result)
+    except ValueError as e:
+        return JSONResponse({"error": str(e)}, status_code=400)
+
+
 @server.custom_route("/api/organizations/{org_id}", methods=["DELETE"])
 async def api_delete_org(request: Request):
     rm.remove_org(request.path_params["org_id"])
