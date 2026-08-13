@@ -1419,6 +1419,17 @@ function setOrgMode(mode) {
 tabOrgLocalEl.onclick = () => setOrgMode("local");
 tabOrgCloudEl.onclick = () => setOrgMode("cloud");
 
+// Derives a reasonable org name straight from the repo URL (same trick as
+// the Sync Agent's default sync folder) -- used whenever the repo itself
+// doesn't have a confirmed name recorded (org.json missing, e.g. a repo
+// from before that existed) so there's still SOMETHING pre-filled instead
+// of an empty field with no clue what this repo was ever called.
+function repoNameGuess(repoUrl) {
+  let name = repoUrl.replace(/\/+$/, "").split("/").pop() || "repo";
+  if (name.endsWith(".git")) name = name.slice(0, -4);
+  return name.replace(/\s+/g, "-");
+}
+
 // Probes the repo (a real, throwaway clone server-side) as soon as a
 // Cloud repo URL is entered -- if someone else already initialized an org
 // in it, this is what lets "New Organization" pre-fill the name and warn
@@ -1438,6 +1449,7 @@ async function discoverOrgFromRepo() {
     });
     if (!result.initialized) {
       orgDiscoverInfoEl.classList.add("hidden");
+      if (!orgNameInputEl.value.trim()) orgNameInputEl.value = repoNameGuess(repoUrl);
       return;
     }
     const projectList = result.projects.length
@@ -1449,7 +1461,11 @@ async function discoverOrgFromRepo() {
       )}</b> with ${result.projects.length} project(s):${projectList}Using that name below will pick up its existing projects automatically. If you meant to start something new, use a different, empty repo instead.`;
       if (!orgNameInputEl.value.trim()) orgNameInputEl.value = result.org_name;
     } else {
-      orgDiscoverInfoEl.innerHTML = `This repo already has ${result.projects.length} project(s) in it (from before org names were stored in the repo):${projectList}Name your org to match whatever the other person(s) using it call it, or use a different, empty repo instead.`;
+      const guess = repoNameGuess(repoUrl);
+      orgDiscoverInfoEl.innerHTML = `This repo already has ${result.projects.length} project(s) in it (from before org names were stored in the repo):${projectList}Guessed <b>${escapeHtml(
+        guess
+      )}</b> below from the repo's own name -- rename it if the people already using this repo call it something else.`;
+      if (!orgNameInputEl.value.trim()) orgNameInputEl.value = guess;
     }
   } catch (e) {
     orgDiscoverInfoEl.textContent = `Could not check this repo: ${e.message}`;
