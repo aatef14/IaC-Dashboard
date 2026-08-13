@@ -360,6 +360,11 @@ repo:
   private repo it has no cached credential for, then remembers it. Give
   them an **HTTPS** repo URL (`https://github.com/...`), not an SSH one, so
   this kicks in automatically.
+- **Every Cloud org auto-syncs in the background every ~5 minutes**, not
+  just when its page happens to be open -- the one piece of the standalone
+  Sync Agent (below) worth keeping even though this IS someone's own
+  machine now: without it, an org would only ever refresh when you
+  actually visit it.
 
 ### Syncing to your own computer when you're using someone else's dashboard
 

@@ -96,6 +96,29 @@ def _wait_for_server_then_open_browser():
     webbrowser.open(url)
 
 
+_AUTO_SYNC_INTERVAL_SECONDS = 5 * 60
+
+
+def _auto_sync_cloud_orgs_loop():
+    """The one piece of the standalone Sync Agent still worth having now
+    that this IS someone's own machine: today, a Cloud org only actually
+    pulls when its page is opened or the editor lists files (see
+    sync_cloud_org's callers in server.py) -- fine while you're using it,
+    but it goes stale the moment you're not. This keeps every Cloud org
+    fresh in the background regardless, same ~5-minute cadence the
+    standalone agent used. Runs forever; one bad tick (no network) doesn't
+    stop the next one."""
+    while True:
+        time.sleep(_AUTO_SYNC_INTERVAL_SECONDS)
+        try:
+            for org in rm.list_orgs():
+                if org.get("mode") == "cloud":
+                    rm.sync_cloud_org(org["id"])
+        except Exception:
+            pass
+    webbrowser.open(url)
+
+
 # Mirrors install.ps1's own list -- Git for Windows here also bundles Git
 # Credential Manager, which is what makes cloning/pushing a private GitHub
 # repo "just work" the first time (pops a browser sign-in itself, caches
@@ -288,6 +311,7 @@ def main():
 
     threading.Thread(target=_run_server, daemon=True).start()
     threading.Thread(target=_wait_for_server_then_open_browser, daemon=True).start()
+    threading.Thread(target=_auto_sync_cloud_orgs_loop, daemon=True).start()
     _run_tray_icon()
 
 
