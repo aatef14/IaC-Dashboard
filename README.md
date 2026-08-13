@@ -325,46 +325,17 @@ so everyone stays in sync through that repo instead of one shared server.
   deletion. A push failure surfaces as "saved locally but couldn't push"
   instead of failing silently.
 
-### Running your own instance (Desktop app)
-
-The paragraph above says "each person runs their own separate dashboard
-instance" -- **IaCDashboard.exe** is what makes that a double-click instead
-of installing Python and running `python server.py` from a clone of this
-repo:
-
-- Build it with `.\build_desktop_app.ps1` (or ask whoever maintains this repo
-  for the built `.exe`) and hand the single file to anyone who wants their
-  own instance. No Python install needed on their machine.
-- Running it starts the dashboard bound to `127.0.0.1` only (never
-  LAN-shared -- this is meant to be genuinely theirs, not another shared
-  server), opens it in their default browser automatically, and leaves a
-  small tray icon running in the background (right-click it to Quit).
-- Their data -- organizations, projects, run history -- lives entirely in
-  `%LOCALAPPDATA%\IaCDashboard` on their own machine, completely separate
-  from anyone else's. To join a Cloud org someone else already created,
-  create an Organization with the same name + repo URL, same as described
-  above -- New Organization now also probes the repo URL as you type it and
-  pre-fills the name for you if it can find one (see `org.json`/manifest in
-  the repo).
-- **Installs Git, Terraform, and the Azure CLI itself** on first run if
-  they're missing (via `winget`, same packages `install.ps1` uses) -- a
-  small progress window shows while that happens, then the dashboard opens
-  as normal. If `winget` genuinely isn't available, it warns instead and
-  starts anyway (Init/Plan/Apply just won't work until those are installed
-  by hand). Their own `az login` is still on them -- every Init/Plan/Apply
-  then runs under *their* Azure identity, not whoever they might otherwise
-  be sharing a dashboard with.
-- **GitHub auth for a private repo needs no setup either** -- Git for
-  Windows bundles Git Credential Manager, which pops open a browser to
-  sign into GitHub the first time git actually needs to clone/push a
-  private repo it has no cached credential for, then remembers it. Give
-  them an **HTTPS** repo URL (`https://github.com/...`), not an SSH one, so
-  this kicks in automatically.
-- **Every Cloud org auto-syncs in the background every ~5 minutes**, not
-  just when its page happens to be open -- the one piece of the standalone
-  Sync Agent (below) worth keeping even though this IS someone's own
-  machine now: without it, an org would only ever refresh when you
-  actually visit it.
+To run your own separate instance rather than being a browser client of
+someone else's: clone this repo, run `install.ps1` once (checks/installs
+Terraform, Azure CLI, Git via `winget`, then `pip install`s the rest), then
+`start.ps1` any time after. Your own `organizations.json`/`projects.json`/
+`runs.db` live locally, separate from anyone else's -- create a Cloud
+Organization with the same name + repo URL as theirs and you're synced
+through that repo. GitHub auth for a private repo needs no extra setup:
+Git for Windows bundles Git Credential Manager, which opens a browser to
+sign into GitHub the first time git needs to clone/push a repo it has no
+cached credential for (give it an **HTTPS** URL, not SSH, for this to
+trigger).
 
 ### Syncing to your own computer when you're using someone else's dashboard
 
@@ -468,7 +439,6 @@ ever be a human clicking a button, never an agent deciding to do it.
 | `project-data/<project_id>/runs/<run_id>/` | Everything one plan run produced (`plan.tfplan`, `diff.json`) -- lives here, NOT inside the actual Terraform repo, so the dashboard never writes anything into your IaC project folder |
 | `cloud-orgs/<org_id>/repo/` | A Cloud org's cloned repo -- this machine's working copy only, see **Cloud organizations** above. `.iac-dashboard/projects.json` inside it (committed to the repo itself, not listed here since it's not local-only) is the manifest of that org's projects |
 | `sync_agent/` | Standalone companion program (see its own README) -- lets someone using your shared dashboard as a browser client sync a Cloud org's repo to their OWN computer, since a website's JS can't otherwise touch a visitor's disk |
-| `desktop_app.py` / `build_desktop_app.ps1` | Packages this same dashboard into a standalone `IaCDashboard.exe` for one person's own full, independent instance -- see **Running your own instance (Desktop app)** above |
 | `static/` | Dashboard HTML/CSS/JS |
 | `install.ps1` | One-shot setup: checks/installs Terraform, Azure CLI, Git, Graphviz via `winget`, `pip install`s the Python side, then runs `start.ps1` |
 | `start.ps1` / `stop.ps1` | Background process management (PID tracked in `.server.pid`) |

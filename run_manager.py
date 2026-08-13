@@ -282,8 +282,17 @@ def _run_git(args: list[str], cwd: str, timeout: int = 60) -> str:
 def _clone_cloud_repo(repo_url: str, repo_dir: str):
     os.makedirs(os.path.dirname(repo_dir), exist_ok=True)
     git_exe = _resolve_executable("git")
+    # 10 minutes, not the usual ~2 -- this is the ONE clone that can involve
+    # a real person clicking through an interactive GitHub sign-in (Git
+    # Credential Manager's browser-based OAuth, first time this machine
+    # has no cached credential for the host). A short timeout here would
+    # kill git mid-auth and fail org creation over nothing but someone
+    # taking a normal amount of time to read a consent screen. Every OTHER
+    # git call (_run_git, used for pulls/pushes/the periodic auto-sync)
+    # keeps its normal timeout -- the credential is cached after this one
+    # success, so nothing later ever needs to wait on a person again.
     result = subprocess.run(
-        [git_exe, "clone", repo_url, repo_dir], capture_output=True, text=True, timeout=120, creationflags=_NO_WINDOW_FLAGS
+        [git_exe, "clone", repo_url, repo_dir], capture_output=True, text=True, timeout=600, creationflags=_NO_WINDOW_FLAGS
     )
     if result.returncode != 0:
         raise ValueError(f"could not clone '{repo_url}': {result.stderr.strip() or result.stdout.strip()}")
