@@ -16,3 +16,10 @@
 # redirect). Pick any random string, then add the same value as an
 # Authorization header in the consuming repo's .mcp.json.
 # $env:MCP_SHARED_SECRET = "..."
+
+# Triggers GitHub's browser sign-in (via Git Credential Manager) the
+# instant the dashboard starts, instead of waiting until you actually
+# create/join a Cloud org pointing at this repo. Set it to the SAME Cloud
+# org repo URL you'll paste into "New Organization" later -- must be
+# HTTPS (https://github.com/...), not SSH, for this to trigger anything.
+# $env:IAC_DASHBOARD_PREWARM_REPO_URL = "https://github.com/you/your-repo.git"

@@ -28,6 +28,7 @@ import io
 import json
 import mimetypes
 import os
+import threading
 import time
 import urllib.parse
 
@@ -1662,6 +1663,14 @@ app = AuthGateMiddleware(server.streamable_http_app(host=HOST))
 
 if __name__ == "__main__":
     rm.bootstrap()
+    # Optional: triggers GitHub's browser sign-in (via Git Credential
+    # Manager) right now instead of waiting until someone actually
+    # creates/joins a Cloud org pointing at this repo -- see
+    # secrets.example.ps1. Backgrounded so a slow/no network doesn't delay
+    # the dashboard itself from starting.
+    _prewarm_repo_url = os.environ.get("IAC_DASHBOARD_PREWARM_REPO_URL")
+    if _prewarm_repo_url:
+        threading.Thread(target=rm.prewarm_github_auth, args=(_prewarm_repo_url,), daemon=True).start()
     print(f"IaC-Dashboard listening on http://{HOST}:{PORT}")
     print(f"  Dashboard:  http://{HOST}:{PORT}/")
     print(f"  MCP (HTTP): http://{HOST}:{PORT}/mcp")

@@ -298,6 +298,26 @@ def _clone_cloud_repo(repo_url: str, repo_dir: str):
         raise ValueError(f"could not clone '{repo_url}': {result.stderr.strip() or result.stdout.strip()}")
 
 
+def prewarm_github_auth(repo_url: str):
+    """Fire-and-forget: runs `git ls-remote` against repo_url right at
+    startup instead of waiting for someone to actually create/join a Cloud
+    org pointing at it. Git Credential Manager's browser-based GitHub
+    sign-in triggers on this exactly the same as a real clone would -- this
+    just moves that one-time prompt earlier (dashboard startup) instead of
+    mid-workflow (clicking Create on a brand new org). `ls-remote` needs no
+    cwd inside a repo and never writes anything, so it's safe to run before
+    anything else exists. Best-effort: any failure (bad URL, no network,
+    git missing) is silently ignored -- this is UX polish, not something
+    the dashboard depends on working."""
+    try:
+        git_exe = _resolve_executable("git")
+        subprocess.run(
+            [git_exe, "ls-remote", repo_url], timeout=600, capture_output=True, creationflags=_NO_WINDOW_FLAGS
+        )
+    except Exception:
+        pass
+
+
 def _check_repo_public_warning(repo_url: str) -> str | None:
     """Best-effort, non-fatal: a Cloud org commits real project data (tfvars
     values, resource names, paths) into repo_url, so a public repo would
