@@ -337,17 +337,6 @@ sign into GitHub the first time git needs to clone/push a repo it has no
 cached credential for (give it an **HTTPS** URL, not SSH, for this to
 trigger).
 
-### Syncing to your own computer when you're using someone else's dashboard
-
-If you're just a browser client on someone else's shared instance (their
-LAN IP) rather than running your own, there's no local folder on *your*
-machine at all by default -- everything lives on their server, since a
-website's JS can't reach your disk. **sync_agent/** is a small companion
-program that closes that gap: run it, paste its token into the dashboard's
-"Local Sync Agent" panel (shown for a Cloud org), pick a folder, and from
-then on "Sync to my computer" pulls/pushes a real local copy on your own
-machine -- see [sync_agent/README.md](sync_agent/README.md).
-
 ## Apply safety
 
 Apply is never one click on either side, whether it's a normal plan or a
@@ -438,7 +427,6 @@ ever be a human clicking a button, never an agent deciding to do it.
 | `projects.json` | Saved Work Projects (org_id, name, folder, deployment, environment, cloud_provider) |
 | `project-data/<project_id>/runs/<run_id>/` | Everything one plan run produced (`plan.tfplan`, `diff.json`) -- lives here, NOT inside the actual Terraform repo, so the dashboard never writes anything into your IaC project folder |
 | `cloud-orgs/<org_id>/repo/` | A Cloud org's cloned repo -- this machine's working copy only, see **Cloud organizations** above. `.iac-dashboard/projects.json` inside it (committed to the repo itself, not listed here since it's not local-only) is the manifest of that org's projects |
-| `sync_agent/` | Standalone companion program (see its own README) -- lets someone using your shared dashboard as a browser client sync a Cloud org's repo to their OWN computer, since a website's JS can't otherwise touch a visitor's disk |
 | `static/` | Dashboard HTML/CSS/JS |
 | `install.ps1` | One-shot setup: checks/installs Terraform, Azure CLI, Git, Graphviz via `winget`, `pip install`s the Python side, then runs `start.ps1` |
 | `start.ps1` / `stop.ps1` | Background process management (PID tracked in `.server.pid`) |

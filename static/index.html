@@ -59,10 +59,7 @@
     <div id="org-title-bar">
       <div class="org-title-main">
         <h2 id="org-view-name"></h2>
-        <span id="local-sync-wrap" class="local-sync-wrap">
-          <span id="local-sync-pill" class="pill hidden"></span>
-          <button id="btn-update-agent" class="btn small hidden">Update agent</button>
-        </span>
+        <span id="cloud-sync-pill" class="pill hidden"></span>
       </div>
       <button id="btn-add-project" class="btn primary">+ Add Work Project</button>
     </div>
@@ -416,29 +413,6 @@
       <div class="modal-actions">
         <button class="btn modal-close">Cancel</button>
         <button id="btn-create-org" class="btn primary">Create Organization</button>
-      </div>
-    </div>
-
-    <div id="agent-configure-modal" class="modal hidden">
-      <h2>Set up local sync</h2>
-      <p class="muted">This creates a live, synced copy of <b id="agent-configure-repo-label"></b> on
-        <b>this computer</b>, at <code id="agent-configure-default-path"></code> -- the agent creates that folder
-        itself, so you don't need to pick one. The agent will automatically add, commit, and push whatever ends up
-        in there as part of keeping it in sync, so it's kept separate from anything else on your machine.</p>
-
-      <label class="field-label">Agent token</label>
-      <input id="agent-token-input" placeholder="paste the token the agent printed/copied on startup" />
-
-      <p class="muted"><a href="#" id="link-agent-custom-folder">Use a different folder instead&hellip;</a></p>
-      <div id="agent-custom-folder-row" class="confirm-row hidden">
-        <input id="agent-local-dir-input" placeholder="C:\path\to\local\folder" readonly />
-        <button id="btn-browse-agent-folder" class="btn">Browse&hellip;</button>
-      </div>
-
-      <div id="agent-setup-error" class="warn-text hidden"></div>
-      <div class="modal-actions">
-        <button class="btn modal-close">Cancel</button>
-        <button id="btn-start-agent-sync" class="btn primary">Start Syncing</button>
       </div>
     </div>
 

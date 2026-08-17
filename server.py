@@ -581,26 +581,6 @@ async def vendor_asset(request: Request):
     return FileResponse(full_path, media_type=media_type or "application/octet-stream")
 
 
-_SYNC_AGENT_EXE_PATH = os.path.join(os.path.dirname(__file__), "sync_agent", "dist", "IaCSyncAgent.exe")
-
-
-@server.custom_route("/download/sync-agent", methods=["GET"])
-async def download_sync_agent(request: Request):
-    """Serves the Sync Agent .exe (see sync_agent/README.md) -- built via
-    `python -m PyInstaller --onefile --console --name IaCSyncAgent
-    sync_agent.py` from sync_agent/, gitignored since it's a large binary
-    that should be handed out directly rather than committed. A 404 here
-    just means whoever's running this dashboard instance hasn't built it
-    yet -- not a broken feature."""
-    if not os.path.isfile(_SYNC_AGENT_EXE_PATH):
-        return JSONResponse(
-            {"error": "Sync Agent hasn't been built on this server yet -- see sync_agent/README.md"}, status_code=404
-        )
-    return FileResponse(
-        _SYNC_AGENT_EXE_PATH, media_type="application/octet-stream", filename="IaCSyncAgent.exe"
-    )
-
-
 # ===================================================================================
 # DASHBOARD -- GitHub sign-in (Device Flow)
 # ===================================================================================
@@ -1128,10 +1108,15 @@ async def api_delete_org(request: Request):
 @server.custom_route("/api/organizations/{org_id}/sync", methods=["POST"])
 async def api_sync_org(request: Request):
     """Pull the latest from a Cloud org's repo and pick up any new projects
-    someone else pushed. A no-op (returns {"pulled": false, "warning": null})
-    for a Local org."""
+    someone else pushed. A no-op (returns {"pulled": false, "warning": null,
+    "can_push": null, "push_error": null}) for a Local org. Also checks
+    push access (a real but side-effect-free `git push --dry-run`) -- this
+    is the ONE caller that does, since it's what backs the org page's
+    always-visible sync-status pill; other callers of sync_cloud_org (the
+    in-app editor's file listing, which runs on every navigation) don't,
+    to avoid paying for an extra network round-trip that often."""
     try:
-        result = await asyncio.to_thread(rm.sync_cloud_org, request.path_params["org_id"])
+        result = await asyncio.to_thread(rm.sync_cloud_org, request.path_params["org_id"], True)
         return JSONResponse(result)
     except ValueError as e:
         return JSONResponse({"error": str(e)}, status_code=400)

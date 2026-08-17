@@ -102,6 +102,7 @@ let discoveredDeployments = [];
 // under a `typeof` guard, so it has to exist before initTheme() ever runs.
 let monacoEditorInstance = null;
 let runsPollTimer = null;
+let cloudSyncPollTimer = null;
 let addProjectMode = "existing"; // "existing" | "new" -- which folder-source tab is active in Add Work Project
 
 // ---------- theme (light / dark) ----------
@@ -493,6 +494,7 @@ function showLanding({ pushHistory = true } = {}) {
   currentRunId = null;
   if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
   if (runsPollTimer) { clearInterval(runsPollTimer); runsPollTimer = null; }
+  if (cloudSyncPollTimer) { clearInterval(cloudSyncPollTimer); cloudSyncPollTimer = null; }
   document.title = "IaC-Dashboard";
 
   if (pushHistory && location.pathname + location.search !== "/") {
@@ -547,6 +549,7 @@ function showToolsView({ pushHistory = true } = {}) {
   currentRunId = null;
   if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
   if (runsPollTimer) { clearInterval(runsPollTimer); runsPollTimer = null; }
+  if (cloudSyncPollTimer) { clearInterval(cloudSyncPollTimer); cloudSyncPollTimer = null; }
   document.title = "Tools — IaC-Dashboard";
 
   if (pushHistory && location.pathname !== "/tools") {
@@ -556,220 +559,61 @@ function showToolsView({ pushHistory = true } = {}) {
 
 // ---------- org view (work projects inside one organization) ----------
 
-// Runs automatically every time a Cloud org's page is opened
-// (showOrgView) and every time the in-app editor lists a project's files
-// -- there's no manual "Sync now" button because there's nothing it would
-// do that isn't already covered by just opening the org. No-op server-side
-// for a Local org. Best-effort -- a pull failure (no network, no
-// credentials) is surfaced as a toast, not a blocking error, since
-// whatever synced previously is still viewable.
+const cloudSyncPillEl = document.getElementById("cloud-sync-pill");
+const CLOUD_SYNC_POLL_MS = 60 * 1000; // catches a collaborator's push without needing to leave and reopen the org
+
+// Runs automatically every time a Cloud org's page is opened, every ~60s
+// while it stays open, and every time the in-app editor lists a project's
+// files -- pull failures/permission problems used to only ever surface as
+// a toast (easy to miss, gone the moment it fades) or not at all until
+// someone actually tried to save/create something real. Now they're a
+// persistent pill: hidden for a Local org, hidden entirely while checking.
 async function syncCloudOrg(org) {
-  if (org.mode !== "cloud") return;
-  try {
-    const result = await api(`/api/organizations/${org.id}/sync`, { method: "POST" });
-    if (result.warning) toast(`Cloud sync: ${result.warning}`, { type: "warning", duration: 7000 });
-  } catch (e) {
-    toast(`Cloud sync failed: ${e.message}`, { type: "warning", duration: 7000 });
-  }
-}
-
-// ---------- local sync agent ("Sync to my computer") ----------
-// Talks DIRECTLY to a small local program (IaC-Dashboard Sync Agent)
-// listening on 127.0.0.1 -- a website's JS can't otherwise touch a
-// visitor's own disk, so this is the only way "Sync to my computer" can
-// mean anything real. Every control (repo/folder/when to sync) lives
-// here in the dashboard; the agent itself has no UI beyond a first-run
-// dialog and a tray icon.
-//
-// Shown as a single compact pill (matching the Azure auth pill) rather
-// than a standing panel -- click behavior depends on state: not detected
-// -> downloads the agent, not yet configured -> opens the setup modal,
-// already synced -> triggers a sync right now. Hover always shows the
-// same info (folder, last sync, auto-sync interval) via the existing
-// data-tip tooltip engine.
-
-const AGENT_URL = "http://127.0.0.1:9876";
-const localSyncPillEl = document.getElementById("local-sync-pill");
-const localSyncWrapEl = document.getElementById("local-sync-wrap");
-const btnUpdateAgentEl = document.getElementById("btn-update-agent");
-let agentDetectedForUpdate = false; // set by renderLocalSyncPill -- no point offering "Update" for an agent that isn't even running
-
-localSyncWrapEl.addEventListener("mouseenter", () => {
-  btnUpdateAgentEl.classList.toggle("hidden", !agentDetectedForUpdate);
-});
-localSyncWrapEl.addEventListener("mouseleave", () => btnUpdateAgentEl.classList.add("hidden"));
-btnUpdateAgentEl.onclick = (ev) => {
-  ev.stopPropagation(); // sibling of the pill inside the same hover group -- don't also fire the pill's own click (sync/setup)
-  window.location.href = "/download/sync-agent";
-  toast(
-    "Downloading the latest Sync Agent. Quit the running one (right-click its tray icon) and run the new file -- your token and folder stay configured, nothing to re-enter.",
-    { type: "info", duration: 8000 }
-  );
-};
-const agentConfigureModalEl = document.getElementById("agent-configure-modal");
-const agentConfigureRepoLabelEl = document.getElementById("agent-configure-repo-label");
-const agentConfigureDefaultPathEl = document.getElementById("agent-configure-default-path");
-const agentTokenInputEl = document.getElementById("agent-token-input");
-const agentLocalDirInputEl = document.getElementById("agent-local-dir-input");
-const agentCustomFolderRowEl = document.getElementById("agent-custom-folder-row");
-const linkAgentCustomFolderEl = document.getElementById("link-agent-custom-folder");
-const agentSetupErrorEl = document.getElementById("agent-setup-error");
-const btnBrowseAgentFolderEl = document.getElementById("btn-browse-agent-folder");
-const btnStartAgentSyncEl = document.getElementById("btn-start-agent-sync");
-
-function agentTokenKey(orgId) {
-  return `iac_agent_token_${orgId}`;
-}
-
-// Mirrors sync_agent.py's _default_local_dir -- purely cosmetic (the agent
-// computes and creates the real path itself), just so the modal can show
-// the user where it'll end up before they click Start Syncing.
-function agentDefaultLocalDirLabel(repoUrl) {
-  let repoName = repoUrl.replace(/\/+$/, "").split("/").pop() || "repo";
-  if (repoName.endsWith(".git")) repoName = repoName.slice(0, -4);
-  return `~\\IaC-Dashboard\\Cloud-Sync\\${repoName}`;
-}
-
-async function agentFetch(path, opts = {}) {
-  const res = await fetch(`${AGENT_URL}${path}`, opts);
-  const body = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(body.error || `agent HTTP ${res.status}`);
-  return body;
-}
-
-async function renderLocalSyncPill(org) {
   if (org.mode !== "cloud") {
-    localSyncPillEl.classList.add("hidden");
-    agentDetectedForUpdate = false;
+    cloudSyncPillEl.classList.add("hidden");
     return;
   }
-  localSyncPillEl.classList.remove("hidden");
+  cloudSyncPillEl.className = "pill checking";
+  cloudSyncPillEl.textContent = "Cloud sync: syncing…";
+  cloudSyncPillEl.classList.remove("hidden");
+  cloudSyncPillEl.onclick = null;
 
-  let status;
+  let result;
   try {
-    status = await agentFetch("/status");
+    result = await api(`/api/organizations/${org.id}/sync`, { method: "POST" });
   } catch (e) {
-    // Most common case: the agent just isn't running right now -- not an
-    // error to alarm over, just an offer to get it. Nothing to "update"
-    // if there's no agent detected in the first place.
-    agentDetectedForUpdate = false;
-    localSyncPillEl.className = "pill muted-pill";
-    localSyncPillEl.textContent = "Local sync: not running";
-    localSyncPillEl.dataset.tip = [
-      "Local Sync Agent",
-      "No agent detected on this computer.",
-      "Click to download it -- see sync_agent/README.md for what it does and why it's needed.",
-    ].join("\n");
-    localSyncPillEl.onclick = () => {
-      window.location.href = "/download/sync-agent";
-    };
+    cloudSyncPillEl.className = "pill error";
+    cloudSyncPillEl.textContent = "Cloud sync: failed";
+    cloudSyncPillEl.dataset.tip = `Cloud sync\n${e.message}\n\nClick to retry.`;
+    cloudSyncPillEl.onclick = () => syncCloudOrg(org);
     return;
   }
 
-  agentDetectedForUpdate = true;
-
-  const configuredForThisOrg = status.configured && status.repo_url === org.repo_url;
-
-  if (!configuredForThisOrg) {
-    localSyncPillEl.className = "pill checking";
-    localSyncPillEl.textContent = "Local sync: not set up";
-    localSyncPillEl.dataset.tip = [
-      "Local Sync Agent",
-      "Agent detected on this computer, but it isn't syncing this org yet.",
-      "Click to set it up.",
-    ].join("\n");
-    localSyncPillEl.onclick = () => openAgentConfigureModal(org);
-    return;
+  const tipLines = ["Cloud sync"];
+  if (result.warning) {
+    tipLines.push(`Pull warning: ${result.warning}`);
+  } else {
+    tipLines.push(`Last synced: ${fmtRelative(Date.now() / 1000)}`);
   }
-
-  const lastSynced = status.last_synced_at ? fmtRelative(status.last_synced_at) : "never";
-  const autoSyncMins = status.auto_sync_interval_seconds ? Math.round(status.auto_sync_interval_seconds / 60) : null;
-  localSyncPillEl.className = "pill ok";
-  localSyncPillEl.textContent = "Local sync: synced";
-  localSyncPillEl.dataset.tip = [
-    "Local Sync Agent",
-    `Folder: ${status.local_dir}`,
-    `Last synced: ${lastSynced}`,
-    autoSyncMins ? `Auto-syncs every ~${autoSyncMins} min` : "",
-    "",
-    "Click this pill to sync right now.",
-  ]
-    .filter(Boolean)
-    .join("\n");
-  localSyncPillEl.onclick = () => triggerManualAgentSync(org);
-}
-
-async function triggerManualAgentSync(org) {
-  const token = localStorage.getItem(agentTokenKey(org.id));
-  localSyncPillEl.className = "pill checking";
-  localSyncPillEl.textContent = "Local sync: syncing…";
-  try {
-    const result = await agentFetch("/sync", { method: "POST", headers: { Authorization: `Bearer ${token}` } });
-    toast(result.warning ? `Synced with a warning: ${result.warning}` : "Synced to your computer.", {
-      type: result.warning ? "warning" : "success",
-    });
-  } catch (e) {
-    toast(`Sync failed: ${e.message}`, { type: "error", duration: 7000 });
-  } finally {
-    renderLocalSyncPill(org);
+  if (result.can_push === false) {
+    tipLines.push("", `Can't push here: ${result.push_error}`, "You can view/edit locally, but saves won't reach the repo until this is fixed (e.g. ask the repo owner to add you as a collaborator).");
+  } else if (result.can_push === true) {
+    tipLines.push("You have push access to this repo.");
   }
-}
+  tipLines.push("", "Click to sync right now.");
+  cloudSyncPillEl.dataset.tip = tipLines.join("\n");
 
-function openAgentConfigureModal(org) {
-  agentConfigureRepoLabelEl.textContent = org.repo_url;
-  agentConfigureDefaultPathEl.textContent = agentDefaultLocalDirLabel(org.repo_url);
-  agentTokenInputEl.value = localStorage.getItem(agentTokenKey(org.id)) || "";
-  agentLocalDirInputEl.value = "";
-  agentCustomFolderRowEl.classList.add("hidden");
-  agentSetupErrorEl.classList.add("hidden");
-  openModal(agentConfigureModalEl);
-
-  linkAgentCustomFolderEl.onclick = (e) => {
-    e.preventDefault();
-    agentCustomFolderRowEl.classList.remove("hidden");
-  };
-
-  btnBrowseAgentFolderEl.onclick = async () => {
-    agentSetupErrorEl.classList.add("hidden");
-    const t = agentTokenInputEl.value.trim();
-    if (!t) {
-      agentSetupErrorEl.textContent = "Paste the agent token first.";
-      agentSetupErrorEl.classList.remove("hidden");
-      return;
-    }
-    try {
-      const { path } = await agentFetch("/browse-folder", { method: "POST", headers: { Authorization: `Bearer ${t}` } });
-      if (path) agentLocalDirInputEl.value = path;
-    } catch (e) {
-      agentSetupErrorEl.textContent = e.message;
-      agentSetupErrorEl.classList.remove("hidden");
-    }
-  };
-
-  btnStartAgentSyncEl.onclick = async () => {
-    agentSetupErrorEl.classList.add("hidden");
-    const t = agentTokenInputEl.value.trim();
-    const dir = agentLocalDirInputEl.value.trim();
-    if (!t) {
-      agentSetupErrorEl.textContent = "Paste the agent token first.";
-      agentSetupErrorEl.classList.remove("hidden");
-      return;
-    }
-    try {
-      await agentFetch("/configure", {
-        method: "POST",
-        headers: { Authorization: `Bearer ${t}`, "Content-Type": "application/json" },
-        body: JSON.stringify(dir ? { repo_url: org.repo_url, local_dir: dir } : { repo_url: org.repo_url }),
-      });
-      localStorage.setItem(agentTokenKey(org.id), t);
-      closeModals();
-      toast("Local sync set up.", { type: "success" });
-      renderLocalSyncPill(org);
-    } catch (e) {
-      agentSetupErrorEl.textContent = e.message;
-      agentSetupErrorEl.classList.remove("hidden");
-    }
-  };
+  if (result.can_push === false) {
+    cloudSyncPillEl.className = "pill error";
+    cloudSyncPillEl.textContent = "Cloud sync: can't push";
+  } else if (result.warning) {
+    cloudSyncPillEl.className = "pill warn";
+    cloudSyncPillEl.textContent = "Cloud sync: pull issue";
+  } else {
+    cloudSyncPillEl.className = "pill ok";
+    cloudSyncPillEl.textContent = "Cloud sync: synced";
+  }
+  cloudSyncPillEl.onclick = () => syncCloudOrg(org).then(() => refreshProjects());
 }
 
 async function showOrgView(org, { pushHistory = true } = {}) {
@@ -778,6 +622,7 @@ async function showOrgView(org, { pushHistory = true } = {}) {
   currentRunId = null;
   if (currentEventSource) { currentEventSource.close(); currentEventSource = null; }
   if (runsPollTimer) { clearInterval(runsPollTimer); runsPollTimer = null; }
+  if (cloudSyncPollTimer) { clearInterval(cloudSyncPollTimer); cloudSyncPollTimer = null; }
 
   // Coming back up from a project workspace animates the other direction.
   // Has to be read BEFORE revealView, which hides the other views.
@@ -796,8 +641,10 @@ async function showOrgView(org, { pushHistory = true } = {}) {
   }
 
   await syncCloudOrg(org);
-  renderLocalSyncPill(org); // best-effort, doesn't block the rest of the page on the agent probe
   await refreshProjects();
+  if (org.mode === "cloud") {
+    cloudSyncPollTimer = setInterval(() => syncCloudOrg(org), CLOUD_SYNC_POLL_MS);
+  }
 }
 
 // ---------- URL routing (back/forward + refresh-safe deep links) ----------

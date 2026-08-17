@@ -490,7 +490,7 @@ def _sync_projects_from_manifest(org: dict):
             continue  # e.g. folder not actually present in this clone yet -- skip, don't blow up the whole sync
 
 
-def sync_cloud_org(org_id: str) -> dict:
+def sync_cloud_org(org_id: str, check_push_access: bool = False) -> dict:
     """Pulls the latest from the org's repo and picks up any new projects
     someone else pushed -- called when opening a Cloud org's page. A pull
     failure (no network, no credentials) is reported back rather than
@@ -505,12 +505,23 @@ def sync_cloud_org(org_id: str) -> dict:
     specifically because this clone exists ONLY for the dashboard's own
     automated reads/writes, which always commit+push immediately -- unlike
     a normal working repo, there's never a real uncommitted edit here to
-    lose."""
+    lose.
+
+    check_push_access=True additionally runs `git push --dry-run` -- a
+    real round-trip to the remote that authenticates and checks
+    permissions but transfers nothing and changes nothing, so it's safe to
+    run just to find out "can this person actually push here" (e.g. clone
+    access via a public repo, but no write/collaborator access -- the exact
+    403 that otherwise only ever surfaced AFTER someone tried to save
+    something real). Off by default -- it's an extra network call, so
+    callers that sync far more often than a person actually opens the org
+    page (e.g. the in-app editor's file listing, on every navigation)
+    don't pay for it every time."""
     org = get_org(org_id)
     if org is None:
         raise ValueError("unknown org_id")
     if org.get("mode") != "cloud":
-        return {"pulled": False, "warning": None}
+        return {"pulled": False, "warning": None, "can_push": None, "push_error": None}
     try:
         _run_git(["pull", "--ff-only"], cwd=org["local_repo_path"], timeout=120)
         pulled, warning = True, None
@@ -530,7 +541,16 @@ def sync_cloud_org(org_id: str) -> dict:
     except Exception:
         pass  # e.g. brand new repo with no commits yet -- nothing to restore
     _sync_projects_from_manifest(org)
-    return {"pulled": pulled, "warning": warning}
+
+    can_push, push_error = None, None
+    if check_push_access:
+        try:
+            _run_git(["push", "--dry-run"], cwd=org["local_repo_path"], timeout=30)
+            can_push = True
+        except Exception as e:
+            can_push, push_error = False, str(e)
+
+    return {"pulled": pulled, "warning": warning, "can_push": can_push, "push_error": push_error}
 
 
 def list_cloud_repo_folders(org_id: str) -> list[str]:
